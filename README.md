@@ -45,6 +45,10 @@ Status reporting:
 - Updates timeline labels:
   - `compliance:fail`
   - `compliance:pass`
+- Manual re-run: comment `/recheck` on a PR to force compliance checks again.
+- Manual re-run (label actions):
+  - remove `compliance:fail` from the PR, or
+  - add `compliance:recheck` to the PR (bot removes it after recheck).
 
 ## Repository files
 

@@ -4,6 +4,7 @@ const PR_COMPLIANCE_MARKER = "<!-- kumpeapps-pr-compliance -->";
 const DEPENDABOT_GREETING_MARKER = "<!-- kumpeapps-dependabot-greeting -->";
 const PR_COMPLIANCE_PASS_LABEL = "compliance:pass";
 const PR_COMPLIANCE_FAIL_LABEL = "compliance:fail";
+const PR_COMPLIANCE_RECHECK_LABEL = "compliance:recheck";
 const SEVERITY_RANK = {
   low: 1,
   medium: 2,
@@ -54,6 +55,9 @@ module.exports = (app) => {
     const { issue, repository, comment } = context.payload;
 
     if (issue.pull_request) {
+      if (parseRecheckCommand(comment.body || "")) {
+        await runPullRequestComplianceByNumber(context, repository.owner.login, repository.name, issue.number);
+      }
       return;
     }
 
@@ -168,17 +172,54 @@ module.exports = (app) => {
       await evaluatePullRequestCompliance(context);
     }
   );
+
+  app.on(["pull_request.unlabeled", "pull_request.labeled"], async (context) => {
+    const { pull_request: pullRequest, repository, action, label } = context.payload;
+    const labelName = normalizeType(label?.name);
+
+    const shouldRecheck =
+      (action === "unlabeled" && labelName === PR_COMPLIANCE_FAIL_LABEL) ||
+      (action === "labeled" && labelName === PR_COMPLIANCE_RECHECK_LABEL);
+
+    if (!shouldRecheck) {
+      return;
+    }
+
+    const owner = repository.owner.login;
+    const repo = repository.name;
+
+    await runPullRequestComplianceByNumber(context, owner, repo, pullRequest.number);
+
+    if (action === "labeled" && labelName === PR_COMPLIANCE_RECHECK_LABEL) {
+      await removeLabelIfPresent(context, owner, repo, pullRequest.number, PR_COMPLIANCE_RECHECK_LABEL);
+    }
+  });
 };
 
 async function evaluatePullRequestCompliance(context) {
   const { pull_request: pullRequest, repository } = context.payload;
+  await evaluatePullRequestComplianceCore(context, repository, pullRequest);
+}
+
+async function runPullRequestComplianceByNumber(context, owner, repo, pullNumber) {
+  const pullResponse = await context.octokit.pulls.get({
+    owner,
+    repo,
+    pull_number: pullNumber,
+  });
+
+  const repositoryResponse = await context.octokit.repos.get({ owner, repo });
+  await evaluatePullRequestComplianceCore(context, repositoryResponse.data, pullResponse.data);
+}
+
+async function evaluatePullRequestComplianceCore(context, repository, pullRequest) {
   const owner = repository.owner.login;
   const repo = repository.name;
   const baseBranch = pullRequest.base.ref;
   const headBranch = pullRequest.head.ref;
   const headLabel = pullRequest.head.label;
 
-  if (isDependabotPullRequest(context)) {
+  if (isDependabotPullRequest(context, pullRequest)) {
     await upsertDependabotGreetingComment(context);
     await setPullRequestComplianceLabels(context, owner, repo, pullRequest.number, "pass");
     await publishPullRequestComplianceCheck(context, {
@@ -314,6 +355,10 @@ function parseTypeCommand(body) {
   }
 
   return match[1];
+}
+
+function parseRecheckCommand(body) {
+  return /(?:^|\n)\/(?:recheck|compliance-recheck)\b/i.test(String(body || ""));
 }
 
 function parseTypeIssueBranch(branchName) {
@@ -581,8 +626,8 @@ async function upsertPullRequestComplianceComment(context, failures) {
   );
 }
 
-function isDependabotPullRequest(context) {
-  const pullRequest = context.payload?.pull_request;
+function isDependabotPullRequest(context, pullRequestArg) {
+  const pullRequest = pullRequestArg || context.payload?.pull_request;
   const actorLogin = normalizeType(context.payload?.sender?.login);
   const prUserLogin = normalizeType(pullRequest?.user?.login);
   const headLogin = normalizeType(pullRequest?.head?.user?.login);
