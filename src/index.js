@@ -680,7 +680,7 @@ async function runSecurityGates(context, owner, repo, baseBranch) {
 
   if (!alertResult.available) {
     failures.push(
-      "Security gate could not read Dependabot alerts. Ensure GitHub App has Dependabot alerts read permission, then re-run checks.",
+      `Security gate could not read Dependabot alerts (${alertResult.reason}). ${alertResult.guidance}`,
     );
   } else {
     const blockingAlerts = alertResult.alerts.filter((alert) => {
@@ -709,7 +709,7 @@ async function runSecurityGates(context, owner, repo, baseBranch) {
 
     if (!secretAlertResult.available) {
       failures.push(
-        "Security gate could not read secret-scanning alerts. Ensure GitHub App has secret scanning alerts read permission, then re-run checks."
+        `Security gate could not read secret-scanning alerts (${secretAlertResult.reason}). ${secretAlertResult.guidance}`
       );
     } else if (secretAlertResult.alerts.length > 0) {
       const preview = secretAlertResult.alerts
@@ -741,9 +741,12 @@ async function getOpenDependabotAlerts(context, owner, repo) {
     };
   } catch (error) {
     context.log.warn({ error }, "Unable to read Dependabot alerts for security gate");
+    const status = Number(error?.status || 0);
     return {
       available: false,
       alerts: [],
+      reason: formatSecurityApiReason(status, "dependabot"),
+      guidance: formatSecurityApiGuidance(status, "Dependabot alerts"),
     };
   }
 }
@@ -767,11 +770,50 @@ async function getOpenSecretScanningAlerts(context, owner, repo) {
     };
   } catch (error) {
     context.log.warn({ error }, "Unable to read secret-scanning alerts for security gate");
+    const status = Number(error?.status || 0);
     return {
       available: false,
       alerts: [],
+      reason: formatSecurityApiReason(status, "secret-scanning"),
+      guidance: formatSecurityApiGuidance(status, "Secret scanning alerts"),
     };
   }
+}
+
+function formatSecurityApiReason(status, gateName) {
+  if (status === 401) {
+    return `${gateName} API returned 401`;
+  }
+
+  if (status === 403) {
+    return `${gateName} API returned 403`;
+  }
+
+  if (status === 404) {
+    return `${gateName} API returned 404`;
+  }
+
+  if (status > 0) {
+    return `${gateName} API returned ${status}`;
+  }
+
+  return `${gateName} API request failed`;
+}
+
+function formatSecurityApiGuidance(status, permissionName) {
+  if (status === 401) {
+    return "Check APP_ID/private key/webhook configuration and ensure the app token can be issued.";
+  }
+
+  if (status === 403) {
+    return `Ensure GitHub App has ${permissionName} set to Read-only, save app settings, and re-approve/reinstall the app on this repository/org.`;
+  }
+
+  if (status === 404) {
+    return `${permissionName} may be unavailable for this repo (feature disabled or unsupported plan). Enable it in repository security settings or adjust policy.`;
+  }
+
+  return "Verify app permissions, installation scope, and repository security feature availability.";
 }
 
 async function setPullRequestComplianceLabels(context, owner, repo, issueNumber, state) {

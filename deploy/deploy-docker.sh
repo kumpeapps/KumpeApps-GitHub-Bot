@@ -110,12 +110,13 @@ read_private_key() {
   local line
 
   echo
-  echo "How do you want to provide the GitHub App private key?"
+  echo "Step 2: Configure GitHub App private key input"
+  echo "(This is separate from the webhook secret.)"
   echo "  1) Path to PEM file"
   echo "  2) Paste PEM content"
 
   while true; do
-    read -r -p "Choose 1 or 2 [1]: " mode
+    read -r -p "Private key input mode (1=PEM file path, 2=paste key) [1]: " mode
     mode="${mode:-1}"
 
     if [[ "$mode" == "1" ]]; then
@@ -199,13 +200,21 @@ ghcr_login_if_requested() {
     local ghcr_user
     local ghcr_token
 
-    ghcr_user="$(prompt "GHCR username")"
+    ghcr_user="$(prompt "GHCR GitHub username (not email)")"
     ghcr_token="$(prompt_secret "GHCR token (read:packages)")"
     validate_nonempty "GHCR username" "$ghcr_user"
     validate_nonempty "GHCR token" "$ghcr_token"
 
     printf "%s" "$ghcr_token" | ${SUDO} docker login ghcr.io -u "$ghcr_user" --password-stdin
   fi
+}
+
+run_compose_preflight() {
+  local install_dir="$1"
+
+  echo "Running docker compose preflight checks..."
+  ${SUDO} docker compose -f "${install_dir}/${COMPOSE_FILE_NAME}" --env-file "${install_dir}/${ENV_FILE_NAME}" config >/dev/null
+  ${SUDO} docker compose -f "${install_dir}/${COMPOSE_FILE_NAME}" --env-file "${install_dir}/${ENV_FILE_NAME}" pull
 }
 
 write_systemd_unit() {
@@ -235,7 +244,13 @@ WantedBy=multi-user.target
 EOF
 
   ${SUDO} systemctl daemon-reload
-  ${SUDO} systemctl enable --now "${APP_NAME}.service"
+  if ! ${SUDO} systemctl enable --now "${APP_NAME}.service"; then
+    echo
+    echo "Service failed to start. Diagnostics:"
+    ${SUDO} systemctl --no-pager --full status "${APP_NAME}.service" || true
+    ${SUDO} journalctl --no-pager -u "${APP_NAME}.service" -n 80 || true
+    exit 1
+  fi
 }
 
 main() {
@@ -261,7 +276,9 @@ main() {
   image="$(prompt "Container image" "$DEFAULT_IMAGE")"
   bot_port="$(prompt "Host port for bot/WAF upstream" "$DEFAULT_BOT_PORT")"
   app_id="$(prompt "GitHub App ID")"
-  webhook_secret="$(prompt_secret "GitHub Webhook Secret")"
+  echo
+  echo "Step 1: Enter GitHub webhook secret"
+  webhook_secret="$(prompt_secret "GitHub Webhook Secret (from GitHub App settings)")"
 
   validate_nonempty "Install directory" "$install_dir"
   validate_nonempty "Container image" "$image"
@@ -274,6 +291,7 @@ main() {
     exit 1
   fi
 
+  echo
   private_key_raw="$(read_private_key)"
   private_key_escaped="$(printf "%s" "$private_key_raw" | escape_newlines)"
 
@@ -293,6 +311,7 @@ main() {
   write_env_file "$install_dir" "$app_id" "$webhook_secret" "$private_key_escaped"
 
   ghcr_login_if_requested
+  run_compose_preflight "$install_dir"
 
   write_systemd_unit "$install_dir"
 

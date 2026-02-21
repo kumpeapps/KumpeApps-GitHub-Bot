@@ -1,203 +1,238 @@
 # KumpeApps-GitHub-Bot
 
-A GitHub App bot (Probot) focused on repository compliance workflows.
+GitHub App bot for repository compliance automation.
 
-## Current scope (Issues)
+This repository is **Docker-only** for production deployment.
 
-This version automates issue compliance in two stages:
+## What it enforces
 
-1. **On issue creation (`issues.opened`)**
-	- If no type is set, the bot tries to infer it from issue title/body.
-	- If it can infer a type, it sets the native GitHub **Type** field.
-	- If it cannot infer a type, it comments asking for a type via:
-		- `/type bug`
-		- `/type feature`
-		- `/type task`
-2. **On issue assignment (`issues.assigned`)**
-	- Ensures a type exists (existing type or inferred).
-	- Creates branch from:
-		- `dev` if it exists,
-		- else `main` if it exists,
-		- else `master`.
-	- Branch name format: `<type>/<issue-number>`
-		- Example: issue `12` with type `bug` => `bug/12`
-	- Comments on the issue telling assignee to resolve under that branch.
+### Issues
 
-## Current scope (Pull Requests)
+On `issues.opened`:
+- If issue **Type** is missing, bot tries to infer from title/body.
+- If inferred, sets native GitHub Issue Type.
+- If not inferred, asks for `/type bug|feature|task`.
 
-For PRs targeting `dev`, `main`, or `master`, the bot enforces:
+On `issues.assigned`:
+- Ensures issue has Type (`bug|feature|task`).
+- Creates branch from `dev`, else `main`, else `master`.
+- Branch format: `type/issue_number` (example: `bug/12`).
 
-- Source branch must be `type/issue_number` (for example `bug/12`)
-- Allowed `type` values are only: `bug`, `feature`, `task`
-- Exception: PRs into `main` or `master` may also come from `dev`
-- If source branch has `issue_number`, that issue must exist and be open
-- Branch `type` must match the referenced issue's GitHub **Type**
-- Source branch must be rebased onto the target base branch
-- PR must contain exactly one commit (squashed)
-- Security gate: Dependabot alerts at/above threshold are warning-only on `dev`, but blocking on `main`/`master` (default threshold: `high`)
-- Security gate: open secret-scanning alerts are always blocking on `dev`/`main`/`master`
+### Pull requests
+
+For PRs targeting `dev`, `main`, or `master`:
+- Source branch must be `type/issue_number`.
+- Allowed type values: `bug`, `feature`, `task`.
+- Exception: PRs into `main/master` may come from `dev`.
+- Referenced issue must exist and be open.
+- Branch type must match referenced issue Type.
+- Branch must be rebased on target base branch.
+- PR must contain exactly one commit (squashed).
+
+Security gates:
+- Dependabot alerts at/above threshold:
+  - warning-only on `dev`
+  - blocking on `main/master`
+- Secret-scanning alerts:
+  - always blocking on `dev/main/master`
 
 Dependabot exception:
-- Dependabot PRs are auto-allowed, reported as passing, and receive a greeting comment.
+- Dependabot PRs auto-pass and get greeting comment.
 
-Checks run on:
-- `pull_request.opened`
-- `pull_request.reopened`
-- `pull_request.edited`
-- `pull_request.ready_for_review`
-- `pull_request.synchronize` (new pushes)
+Status reporting:
+- Publishes pass/fail status checks.
+- Updates timeline labels:
+  - `compliance:fail`
+  - `compliance:pass`
 
-On failure, bot comments on the PR and reports a failing status check.
-It also updates PR labels to create timeline events:
-- `compliance:fail` when checks fail
-- `compliance:pass` when checks pass (including "now passing" transitions)
+## Repository files
 
-## Tech stack
-
-- Node.js 20+
-- [Probot](https://probot.github.io/)
-
-## Docker-only deployment
-
-Container files are included:
 - [Dockerfile](Dockerfile)
 - [docker-compose.yml](docker-compose.yml)
-- [.dockerignore](.dockerignore)
+- [.env.example](.env.example)
+- [deploy/deploy-docker.sh](deploy/deploy-docker.sh)
 - [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)
 
-This project is Docker-first and intended to run as a container behind your WAF/LB/reverse proxy.
-
-### Host installer script (Docker + systemd)
-
-Script included: [deploy/deploy-docker.sh](deploy/deploy-docker.sh)
-
-You can copy this script to a Debian/Ubuntu host and run it to:
-- Install Docker Engine and Docker Compose plugin (optional prompt)
-- Configure app `.env` values interactively
-- Write a compose file for the selected image/port
-- Install and enable a systemd unit that runs `docker compose up -d`
-
-Example:
-
-```bash
-chmod +x deploy/deploy-docker.sh
-./deploy/deploy-docker.sh
-```
-
-The systemd unit created is:
-
-```text
-kumpeapps-github-bot.service
-```
-
-1. Create `.env` with your app secrets:
-
-```bash
-cp .env.example .env
-```
-
-Required values:
-- `APP_ID`
-- `PRIVATE_KEY`
-- `WEBHOOK_SECRET`
-
-Optional runtime values:
-- `HOST=0.0.0.0`
-- `PORT=3197`
-
-2. Pull and run from GHCR via Compose:
-
-```bash
-docker compose up -d
-```
-
-3. Point your WAF/LB/reverse proxy to this upstream:
-
-```text
-http://SERVER_IP:3197
-```
-
-4. Set GitHub App webhook URL:
-
-```text
-https://YOUR_PUBLIC_DOMAIN[:PORT]/api/github/webhooks
-```
-
-## GHCR image publishing (GitHub Actions)
-
-Workflow: [docker-publish.yml](.github/workflows/docker-publish.yml)
-
-- Builds image on:
-	- push to `main`
-	- version tags `v*.*.*`
-	- pull requests to `main` (build only, no push)
-- Pushes to:
-	- `ghcr.io/<owner>/<repo>:latest` (default branch)
-	- branch/tag/sha tags
-- Signs pushed images with Cosign keyless signing (Sigstore/OIDC)
-
-Requirements:
-- Repository Actions enabled
-- Packages permission allowed for GitHub Actions
-- No extra secret required (uses built-in `GITHUB_TOKEN` + OIDC)
-
-Verify a published image signature:
-
-```bash
-cosign verify ghcr.io/<owner>/<repo>:latest \
-	--certificate-oidc-issuer https://token.actions.githubusercontent.com \
-	--certificate-identity-regexp "^https://github.com/<owner>/<repo>/.+"
-```
+## Step-by-step setup
 
 ### 1) Create the GitHub App
 
 In GitHub:
 
 1. Go to **Settings → Developer settings → GitHub Apps → New GitHub App**.
-2. Set **Webhook URL** to your hosted bot endpoint:
+2. Set webhook URL (update later if needed):
 
 ```text
-https://YOUR_BOT_DOMAIN/api/github/webhooks
+https://YOUR_PUBLIC_DOMAIN[:PORT]/api/github/webhooks
 ```
 
-3. Set a **Webhook secret** (save this for `WEBHOOK_SECRET`).
+3. Set a webhook secret (save as `WEBHOOK_SECRET`).
 4. Set repository permissions:
-	- Issues: `Read and write`
-	- Pull requests: `Read-only`
-	- Contents: `Read and write`
-	- Dependabot alerts: `Read-only`
-	- Secret scanning alerts: `Read-only`
-	- Commit statuses: `Read and write`
-	- Checks: `Read and write`
-	- Metadata: `Read-only`
+   - Issues: `Read and write`
+   - Pull requests: `Read-only`
+   - Contents: `Read and write`
+   - Dependabot alerts: `Read-only`
+   - Secret scanning alerts: `Read-only`
+   - Commit statuses: `Read and write`
+   - Checks: `Read and write`
+   - Metadata: `Read-only`
 5. Subscribe to webhook events:
-	- `issues`
-	- `issue_comment`
-	- `pull_request`
-6. Create the app, then generate and download a **private key**.
+   - `issues`
+   - `issue_comment`
+   - `pull_request`
+6. Create app and download private key (`.pem`).
+7. Note your `APP_ID`.
 
-### 2) Install the GitHub App
+### 2) Publish container image to GHCR
 
-After deployment, install the app into your repositories:
+Workflow file: [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)
+
+Behavior:
+- Push to `main`: build + push + sign
+- Tag `v*.*.*`: build + push + sign
+- PR to `main`: build only (no push)
+
+Image naming:
+- `ghcr.io/<owner>/<repo>:latest`
+- branch/tag/sha tags
+
+Signing:
+- Cosign keyless signing (OIDC), no cert purchase required.
+
+Requirements:
+- GitHub Actions enabled
+- GitHub Packages enabled
+
+### 3) Deploy on Docker host (recommended script)
+
+Use [deploy/deploy-docker.sh](deploy/deploy-docker.sh).
+
+Run from this repo (or copy script to host):
+
+```bash
+chmod +x deploy/deploy-docker.sh
+./deploy/deploy-docker.sh
+```
+
+The script can:
+- Install Docker Engine + Compose plugin (optional prompt)
+- Prompt for `APP_ID`, `WEBHOOK_SECRET`, private key
+- Prompt for image and host port (default `3197`)
+- Create install directory with:
+  - `.env`
+  - `docker-compose.yml`
+- Optionally log in to GHCR for private images
+- Install and enable systemd unit:
+
+```text
+kumpeapps-github-bot.service
+```
+
+### 4) Configure WAF / reverse proxy
+
+Point your edge/WAF upstream to:
+
+```text
+http://HOST_IP:3197
+```
+
+Expose HTTPS publicly and route:
+
+```text
+/api/github/webhooks
+```
+
+Set GitHub App webhook URL to your public endpoint:
+
+```text
+https://YOUR_PUBLIC_DOMAIN[:PORT]/api/github/webhooks
+```
+
+### 5) Install app in repositories
+
+Install URL:
 
 ```text
 https://github.com/apps/<your-app-slug>/installations/new
 ```
 
-Once installed, issue automation starts immediately.
+Choose org/repositories and complete installation.
 
-## Type handling details
+## Manual deployment (without script)
 
-- Type is represented by GitHub's built-in **Type** field in the issue sidebar.
-- Supported types (fixed to your issue type configuration):
-	- `bug, feature, task`
-- The bot accepts manual updates from comments:
-	- `/type <value>`
+1. Copy env template:
 
-If an invalid type is supplied, the bot replies with allowed values.
+```bash
+cp .env.example .env
+```
 
-## Next planned scope
+2. Fill required values in `.env`:
+- `APP_ID`
+- `PRIVATE_KEY`
+- `WEBHOOK_SECRET`
 
-- Pull request compliance actions
-- Cross-repository policy configuration
-- Additional branch and merge enforcement policies
+3. Optionally set:
+- `BOT_PORT` (host bind port, defaults to `3197`)
+- `SECURITY_GATES_ENABLED`
+- `SECURITY_GATE_MIN_SEVERITY`
+- `SECRET_SCANNING_GATES_ENABLED`
+
+4. Start:
+
+```bash
+docker compose up -d
+```
+
+## Runtime configuration
+
+From [.env.example](.env.example):
+- `APP_ID`
+- `PRIVATE_KEY`
+- `WEBHOOK_SECRET`
+- `BOT_PORT` (host bind port, default `3197`)
+- `HOST` (default `0.0.0.0`)
+- `PORT` (container port, default `3197`)
+- `SECURITY_GATES_ENABLED` (default `true`)
+- `SECURITY_GATE_MIN_SEVERITY` (default `high`)
+- `SECRET_SCANNING_GATES_ENABLED` (default `true`)
+
+## Verify image signatures
+
+```bash
+cosign verify ghcr.io/<owner>/<repo>:latest \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp "^https://github.com/<owner>/<repo>/.+"
+```
+
+## Operations quick commands
+
+If deployed via `deploy-docker.sh` systemd unit:
+
+```bash
+sudo systemctl status kumpeapps-github-bot.service
+sudo systemctl restart kumpeapps-github-bot.service
+journalctl -u kumpeapps-github-bot.service -f
+```
+
+If managing compose directly:
+
+```bash
+docker compose ps
+docker compose logs -f
+docker compose pull && docker compose up -d
+```
+
+## Troubleshooting
+
+- `401/403` on API calls:
+  - Verify GitHub App permissions and installation scope.
+- Webhooks not arriving:
+  - Check GitHub App webhook delivery logs and WAF/proxy routing.
+- PR checks not publishing:
+  - Confirm Checks + Commit statuses permissions are `Read and write`.
+- Security gate fails unexpectedly:
+  - Confirm Dependabot alerts + Secret scanning alerts permissions.
+  - After changing app permissions, re-approve/reinstall the app on target org/repositories so new permissions take effect.
+  - Ensure Dependabot alerts and Secret scanning are enabled/available for the repository (otherwise APIs can return `404`).
+- Private GHCR image pull fails:
+  - Run `docker login ghcr.io` on host (or use script GHCR login prompt).
