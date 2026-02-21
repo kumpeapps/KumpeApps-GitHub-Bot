@@ -5,6 +5,7 @@ const DEPENDABOT_GREETING_MARKER = "<!-- kumpeapps-dependabot-greeting -->";
 const PR_COMPLIANCE_PASS_LABEL = "compliance:pass";
 const PR_COMPLIANCE_FAIL_LABEL = "compliance:fail";
 const PR_COMPLIANCE_RECHECK_LABEL = "compliance:recheck";
+const PR_AUTOCLOSE_MARKER = "<!-- kumpeapps-issue-autoclose -->";
 const SEVERITY_RANK = {
   low: 1,
   medium: 2,
@@ -326,6 +327,19 @@ async function evaluatePullRequestComplianceCore(context, repository, pullReques
       passed: true,
       detail: "Not required for `dev` promotion into `main/master`.",
     });
+  }
+
+  const autoCloseResult = await ensureIssueAutocloseReference(
+    context,
+    owner,
+    repo,
+    pullRequest,
+    parsedBranch,
+    isDevPromotion
+  );
+  checks.push({ name: "Issue auto-close link", passed: autoCloseResult.passed, detail: autoCloseResult.detail });
+  if (!autoCloseResult.passed) {
+    failures.push(...autoCloseResult.failures);
   }
 
   const isRebased = await isHeadRebasedOnBase(context, owner, repo, baseBranch, headLabel);
@@ -671,6 +685,69 @@ async function validateCommitMessagePrefix(context, owner, repo, pullNumber, bra
   }
 
   return failures;
+}
+
+async function ensureIssueAutocloseReference(context, owner, repo, pullRequest, parsedBranch, isDevPromotion) {
+  if (isDevPromotion) {
+    return {
+      passed: true,
+      detail: "Not required for `dev` promotion into `main/master`.",
+      failures: [],
+    };
+  }
+
+  if (!parsedBranch) {
+    return {
+      passed: false,
+      detail: "Cannot add issue auto-close link because branch does not map to `type/issue_number`.",
+      failures: ["Unable to add issue auto-close link because issue number is not derivable from branch name."],
+    };
+  }
+
+  const issueNumber = parsedBranch.issueNumber;
+  const closingReferenceRegex = new RegExp(
+    `(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+(?:${owner}\\/${repo}#)?#${issueNumber}\\b`,
+    "i"
+  );
+
+  const body = String(pullRequest.body || "");
+  const alreadyLinked = closingReferenceRegex.test(body);
+
+  if (alreadyLinked) {
+    return {
+      passed: true,
+      detail: `PR body already contains an auto-close reference for issue #${issueNumber}.`,
+      failures: [],
+    };
+  }
+
+  const linkLine = `Closes #${issueNumber}`;
+  const addition = `${PR_AUTOCLOSE_MARKER}\n${linkLine}`;
+  const nextBody = body.trim() ? `${body.trim()}\n\n${addition}` : addition;
+
+  try {
+    await context.octokit.pulls.update({
+      owner,
+      repo,
+      pull_number: pullRequest.number,
+      body: nextBody,
+    });
+
+    return {
+      passed: true,
+      detail: `Added auto-close reference to PR body: \`${linkLine}\`.`,
+      failures: [],
+    };
+  } catch (error) {
+    context.log.warn({ error }, "Unable to update PR body with auto-close reference");
+    return {
+      passed: false,
+      detail: `Failed to add auto-close reference to PR body for issue #${issueNumber}.`,
+      failures: [
+        `Unable to update PR body with \`${linkLine}\`. Ensure Pull requests permission is Read & write for this app.`,
+      ],
+    };
+  }
 }
 
 function renderFailureSummary(baseBranch, headBranch, failures, warnings = []) {

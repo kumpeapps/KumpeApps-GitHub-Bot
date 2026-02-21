@@ -29,6 +29,7 @@ For PRs targeting `dev`, `main`, or `master`:
 - Branch must be rebased on target base branch.
 - PR must contain exactly one commit (squashed).
 - Commit message(s) must start with `[branch_name] ` (example: `[bug/12] Fix null guard`).
+- Bot ensures PR body includes an issue-closing link (for example `Closes #123`) so merge auto-closes linked issue.
 
 Security gates:
 - Dependabot alerts at/above threshold:
@@ -79,7 +80,7 @@ https://YOUR_PUBLIC_DOMAIN[:PORT]/api/github/webhooks
 3. Set a webhook secret (save as `WEBHOOK_SECRET`).
 4. Set repository permissions:
    - Issues: `Read and write`
-   - Pull requests: `Read-only`
+  - Pull requests: `Read and write`
    - Contents: `Read and write`
    - Dependabot alerts: `Read-only`
    - Secret scanning alerts: `Read-only`
