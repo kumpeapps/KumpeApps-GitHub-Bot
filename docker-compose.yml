@@ -1,0 +1,14 @@
+services:
+  kumpeapps-github-bot:
+    image: ghcr.io/kumpeapps/kumpeapps-github-bot:latest
+    pull_policy: always
+    container_name: kumpeapps-github-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3197
+    ports:
+      - "${BOT_PORT:-3197}:3197"
