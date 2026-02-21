@@ -35,6 +35,7 @@ Security gates:
   - blocking on `main/master`
 - Secret-scanning alerts:
   - always blocking on `dev/main/master`
+- Security gates are automatically skipped for private repositories.
 
 Dependabot exception:
 - Dependabot PRs auto-pass and get greeting comment.
@@ -234,5 +235,6 @@ docker compose pull && docker compose up -d
   - Confirm Dependabot alerts + Secret scanning alerts permissions.
   - After changing app permissions, re-approve/reinstall the app on target org/repositories so new permissions take effect.
   - Ensure Dependabot alerts and Secret scanning are enabled/available for the repository (otherwise APIs can return `404`).
+  - Note: private repositories skip security gates by policy in this bot.
 - Private GHCR image pull fails:
   - Run `docker login ghcr.io` on host (or use script GHCR login prompt).

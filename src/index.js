@@ -252,7 +252,7 @@ async function evaluatePullRequestCompliance(context) {
     failures.push(`PR must be squashed to a single commit. Found ${commitCount} commits.`);
   }
 
-  const securityGateResult = await runSecurityGates(context, owner, repo, baseBranch);
+  const securityGateResult = await runSecurityGates(context, owner, repo, baseBranch, Boolean(repository.private));
   failures.push(...securityGateResult.failures);
 
   if (failures.length > 0) {
@@ -666,10 +666,14 @@ async function publishPullRequestComplianceCheck(context, { owner, repo, headSha
   }
 }
 
-async function runSecurityGates(context, owner, repo, baseBranch) {
+async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepository) {
   const failures = [];
   const warnings = [];
   const normalizedBase = normalizeType(baseBranch);
+
+  if (isPrivateRepository) {
+    return { failures, warnings };
+  }
 
   if (!isSecurityGateEnabled()) {
     return { failures, warnings };
