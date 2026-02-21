@@ -46,6 +46,10 @@ Status reporting:
 - Updates timeline labels:
   - `compliance:fail`
   - `compliance:pass`
+- Maintains a PR compliance comment that is updated on every run (pass or fail), including:
+  - rule checklist with ✅/❌ per rule
+  - notes for failures
+  - warnings when applicable
 - Manual re-run: comment `/recheck` on a PR to force compliance checks again.
 - Manual re-run (label actions):
   - remove `compliance:fail` from the PR, or

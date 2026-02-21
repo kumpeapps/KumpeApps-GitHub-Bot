@@ -221,6 +221,14 @@ async function evaluatePullRequestComplianceCore(context, repository, pullReques
 
   if (isDependabotPullRequest(context, pullRequest)) {
     await upsertDependabotGreetingComment(context);
+    await upsertPullRequestComplianceComment(context, {
+      passed: true,
+      baseBranch,
+      headBranch,
+      checks: [{ name: "Dependabot policy", passed: true, detail: "Dependabot PR auto-allowed by policy." }],
+      failures: [],
+      warnings: [],
+    });
     await setPullRequestComplianceLabels(context, owner, repo, pullRequest.number, "pass");
     await publishPullRequestComplianceCheck(context, {
       owner,
@@ -247,60 +255,123 @@ async function evaluatePullRequestComplianceCore(context, repository, pullReques
   }
 
   const failures = [];
+  const checks = [];
   const parsedBranch = parseTypeIssueBranch(headBranch);
   const isDevPromotion = ["main", "master"].includes(baseBranch) && normalizeType(headBranch) === "dev";
 
-  if (!parsedBranch && !isDevPromotion) {
+  const branchFormatPassed = Boolean(parsedBranch || isDevPromotion);
+  if (!branchFormatPassed) {
     failures.push(
       `Source branch must follow \`type/issue_number\` (example: \`bug/12\`). For PRs into \`main\` or \`master\`, \`dev\` is also allowed.`
     );
   }
+  checks.push({
+    name: "Source branch naming policy",
+    passed: branchFormatPassed,
+    detail: branchFormatPassed
+      ? `Using source branch \`${headBranch}\`.`
+      : "Expected `type/issue_number` or `dev` when targeting main/master.",
+  });
 
   if (parsedBranch) {
-    if (!ALLOWED_ISSUE_TYPES.includes(parsedBranch.type)) {
+    const allowedTypePassed = ALLOWED_ISSUE_TYPES.includes(parsedBranch.type);
+    if (!allowedTypePassed) {
       failures.push(
         `Branch type \`${parsedBranch.type}\` is not allowed. Use one of: ${ALLOWED_ISSUE_TYPES.map((type) => `\`${type}\``).join(", ")}.`
       );
     }
+    checks.push({
+      name: "Allowed branch type",
+      passed: allowedTypePassed,
+      detail: allowedTypePassed
+        ? `Branch type \`${parsedBranch.type}\` is allowed.`
+        : `Allowed values: ${ALLOWED_ISSUE_TYPES.map((type) => `\`${type}\``).join(", ")}.`,
+    });
 
     const issueState = await getIssueState(context, owner, repo, parsedBranch.issueNumber);
+    let issueRulePassed = true;
+    let issueRuleDetail = `Issue #${parsedBranch.issueNumber} is open and matches branch type.`;
 
     if (issueState.notFound) {
       failures.push(`Issue #${parsedBranch.issueNumber} does not exist in this repository.`);
+      issueRulePassed = false;
+      issueRuleDetail = `Issue #${parsedBranch.issueNumber} does not exist.`;
     } else if (issueState.isPullRequest) {
       failures.push(`Branch references #${parsedBranch.issueNumber}, but that number points to a pull request, not an issue.`);
+      issueRulePassed = false;
+      issueRuleDetail = `#${parsedBranch.issueNumber} points to a pull request, not an issue.`;
     } else if (!issueState.isOpen) {
       failures.push(`Issue #${parsedBranch.issueNumber} is not open.`);
+      issueRulePassed = false;
+      issueRuleDetail = `Issue #${parsedBranch.issueNumber} is not open.`;
     } else {
       const issueType = await getIssueTypeNameByNumber(context, owner, repo, parsedBranch.issueNumber);
       if (!issueType) {
         failures.push(`Issue #${parsedBranch.issueNumber} does not have a valid Type set (expected one of: ${ALLOWED_ISSUE_TYPES.join(", ")}).`);
+        issueRulePassed = false;
+        issueRuleDetail = `Issue #${parsedBranch.issueNumber} type is missing/invalid.`;
       } else if (issueType !== parsedBranch.type) {
         failures.push(
           `Branch type \`${parsedBranch.type}\` must match issue #${parsedBranch.issueNumber} type \`${issueType}\`.`
         );
+        issueRulePassed = false;
+        issueRuleDetail = `Branch type \`${parsedBranch.type}\` does not match issue type \`${issueType}\`.`;
       }
     }
+
+    checks.push({ name: "Referenced issue validity", passed: issueRulePassed, detail: issueRuleDetail });
+  } else if (isDevPromotion) {
+    checks.push({
+      name: "Referenced issue validity",
+      passed: true,
+      detail: "Not required for `dev` promotion into `main/master`.",
+    });
   }
 
   const isRebased = await isHeadRebasedOnBase(context, owner, repo, baseBranch, headLabel);
   if (!isRebased) {
     failures.push(`Source branch is not rebased onto \`${baseBranch}\`. Rebase your branch on top of the current base branch tip.`);
   }
+  checks.push({
+    name: "Rebased on target branch",
+    passed: isRebased,
+    detail: isRebased ? `Branch is rebased on \`${baseBranch}\`.` : `Rebase required on \`${baseBranch}\`.`,
+  });
 
   const commitCount = await getPullRequestCommitCount(context, owner, repo, pullRequest.number);
   if (commitCount > 1) {
     failures.push(`PR must be squashed to a single commit. Found ${commitCount} commits.`);
   }
+  checks.push({
+    name: "Single commit (squash)",
+    passed: commitCount <= 1,
+    detail: `Found ${commitCount} commit${commitCount === 1 ? "" : "s"}.`,
+  });
 
   const commitPrefixFailures = await validateCommitMessagePrefix(context, owner, repo, pullRequest.number, headBranch);
   failures.push(...commitPrefixFailures);
+  checks.push({
+    name: "Commit message prefix",
+    passed: commitPrefixFailures.length === 0,
+    detail:
+      commitPrefixFailures.length === 0
+        ? `All commit subjects start with \`[${headBranch}] \`.`
+        : `${commitPrefixFailures.length} commit message issue(s) found.`,
+  });
 
   const securityGateResult = await runSecurityGates(context, owner, repo, baseBranch, Boolean(repository.private));
   failures.push(...securityGateResult.failures);
+  checks.push(...securityGateResult.ruleResults);
 
   if (failures.length > 0) {
-    await upsertPullRequestComplianceComment(context, failures);
+    await upsertPullRequestComplianceComment(context, {
+      passed: false,
+      baseBranch,
+      headBranch,
+      checks,
+      failures,
+      warnings: securityGateResult.warnings,
+    });
     await setPullRequestComplianceLabels(context, owner, repo, pullRequest.number, "fail");
     await publishPullRequestComplianceCheck(context, {
       owner,
@@ -313,6 +384,14 @@ async function evaluatePullRequestComplianceCore(context, repository, pullReques
     return;
   }
 
+  await upsertPullRequestComplianceComment(context, {
+    passed: true,
+    baseBranch,
+    headBranch,
+    checks,
+    failures: [],
+    warnings: securityGateResult.warnings,
+  });
   await setPullRequestComplianceLabels(context, owner, repo, pullRequest.number, "pass");
   await publishPullRequestComplianceCheck(context, {
     owner,
@@ -618,14 +697,23 @@ function renderPassSummary(baseBranch, headBranch, warnings = []) {
   return lines.join("\n");
 }
 
-async function upsertPullRequestComplianceComment(context, failures) {
+async function upsertPullRequestComplianceComment(context, evaluation) {
+  const { passed, baseBranch, headBranch, checks, failures, warnings } = evaluation;
+
   const commentBody = [
     PR_COMPLIANCE_MARKER,
-    "⚠️ PR compliance checks failed:",
+    passed
+      ? `✅ PR compliance checks passed for \`${headBranch}\` -> \`${baseBranch}\`.`
+      : `❌ PR compliance checks failed for \`${headBranch}\` -> \`${baseBranch}\`.`,
     "",
-    ...failures.map((failure) => `- ${failure}`),
+    "Checklist:",
+    ...checks.map((check) => `${check.passed ? "✅" : "❌"} ${check.name}${check.detail ? ` — ${check.detail}` : ""}`),
     "",
-    "Push updates to this PR branch after fixing these items. Checks will run again automatically.",
+    ...(failures.length > 0 ? ["Notes:", ...failures.map((failure) => `- ${failure}`), ""] : []),
+    ...(warnings.length > 0 ? ["Warnings:", ...warnings.map((warning) => `- ${warning}`), ""] : []),
+    passed
+      ? "Bot will re-run automatically on push/update, label trigger, or `/recheck` command."
+      : "Push updates to this PR branch (or use `/recheck`) after fixing these items.",
   ].join("\n");
 
   const issueContext = context.issue();
@@ -746,14 +834,19 @@ async function publishPullRequestComplianceCheck(context, { owner, repo, headSha
 async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepository) {
   const failures = [];
   const warnings = [];
+  const ruleResults = [];
   const normalizedBase = normalizeType(baseBranch);
 
   if (isPrivateRepository) {
-    return { failures, warnings };
+    ruleResults.push({ name: "Dependabot alert gate", passed: true, detail: "Skipped for private repositories." });
+    ruleResults.push({ name: "Secret-scanning alert gate", passed: true, detail: "Skipped for private repositories." });
+    return { failures, warnings, ruleResults };
   }
 
   if (!isSecurityGateEnabled()) {
-    return { failures, warnings };
+    ruleResults.push({ name: "Dependabot alert gate", passed: true, detail: "Disabled by SECURITY_GATES_ENABLED=false." });
+    ruleResults.push({ name: "Secret-scanning alert gate", passed: true, detail: "Disabled by SECURITY_GATES_ENABLED=false." });
+    return { failures, warnings, ruleResults };
   }
 
   const threshold = getSecurityGateSeverityThreshold();
@@ -779,10 +872,26 @@ async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepos
 
       if (normalizedBase === "dev") {
         warnings.push(message.replace("failed", "warning (non-blocking on dev)"));
+        ruleResults.push({
+          name: "Dependabot alert gate",
+          passed: true,
+          detail: `${blockingAlerts.length} alert(s) found at/above threshold (warning-only on dev).`,
+        });
       } else {
         failures.push(message);
+        ruleResults.push({
+          name: "Dependabot alert gate",
+          passed: false,
+          detail: `${blockingAlerts.length} alert(s) found at/above threshold.`,
+        });
       }
+    } else {
+      ruleResults.push({ name: "Dependabot alert gate", passed: true, detail: "No blocking Dependabot alerts found." });
     }
+  }
+
+  if (!alertResult.available) {
+    ruleResults.push({ name: "Dependabot alert gate", passed: false, detail: `${alertResult.reason}.` });
   }
 
   if (isSecretScanningGateEnabled()) {
@@ -792,6 +901,7 @@ async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepos
       failures.push(
         `Security gate could not read secret-scanning alerts (${secretAlertResult.reason}). ${secretAlertResult.guidance}`
       );
+      ruleResults.push({ name: "Secret-scanning alert gate", passed: false, detail: `${secretAlertResult.reason}.` });
     } else if (secretAlertResult.alerts.length > 0) {
       const preview = secretAlertResult.alerts
         .slice(0, 3)
@@ -801,10 +911,19 @@ async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepos
       failures.push(
         `Security gate failed: ${secretAlertResult.alerts.length} open secret-scanning alert(s). Example(s): ${preview}.`
       );
+      ruleResults.push({
+        name: "Secret-scanning alert gate",
+        passed: false,
+        detail: `${secretAlertResult.alerts.length} open secret-scanning alert(s) found.`,
+      });
+    } else {
+      ruleResults.push({ name: "Secret-scanning alert gate", passed: true, detail: "No open secret-scanning alerts found." });
     }
+  } else {
+    ruleResults.push({ name: "Secret-scanning alert gate", passed: true, detail: "Disabled by SECRET_SCANNING_GATES_ENABLED=false." });
   }
 
-  return { failures, warnings };
+  return { failures, warnings, ruleResults };
 }
 
 async function getOpenDependabotAlerts(context, owner, repo) {
