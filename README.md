@@ -28,6 +28,7 @@ For PRs targeting `dev`, `main`, or `master`:
 - Branch type must match referenced issue Type.
 - Branch must be rebased on target base branch.
 - PR must contain exactly one commit (squashed).
+- Commit message(s) must start with `[branch_name] ` (example: `[bug/12] Fix null guard`).
 
 Security gates:
 - Dependabot alerts at/above threshold:

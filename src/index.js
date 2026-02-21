@@ -293,6 +293,9 @@ async function evaluatePullRequestComplianceCore(context, repository, pullReques
     failures.push(`PR must be squashed to a single commit. Found ${commitCount} commits.`);
   }
 
+  const commitPrefixFailures = await validateCommitMessagePrefix(context, owner, repo, pullRequest.number, headBranch);
+  failures.push(...commitPrefixFailures);
+
   const securityGateResult = await runSecurityGates(context, owner, repo, baseBranch, Boolean(repository.private));
   failures.push(...securityGateResult.failures);
 
@@ -560,6 +563,35 @@ async function getPullRequestCommitCount(context, owner, repo, pullNumber) {
     context.log.warn({ error }, "Unable to fetch pull request details");
     return Number.MAX_SAFE_INTEGER;
   }
+}
+
+async function validateCommitMessagePrefix(context, owner, repo, pullNumber, branchName) {
+  const failures = [];
+  const expectedPrefix = `[${branchName}] `;
+
+  try {
+    const commits = await context.octokit.paginate(context.octokit.pulls.listCommits, {
+      owner,
+      repo,
+      pull_number: pullNumber,
+      per_page: 100,
+    });
+
+    for (const commit of commits) {
+      const message = String(commit?.commit?.message || "");
+      const subject = message.split("\n")[0] || "";
+      if (!subject.startsWith(expectedPrefix)) {
+        failures.push(
+          `Commit message must start with \`${expectedPrefix}\`. Found commit \`${commit.sha.slice(0, 7)}\` subject: \`${subject || "<empty>"}\`.`
+        );
+      }
+    }
+  } catch (error) {
+    context.log.warn({ error }, "Unable to validate commit message prefix");
+    failures.push("Unable to validate commit message prefix due to API error. Re-run checks after resolving access/API issues.");
+  }
+
+  return failures;
 }
 
 function renderFailureSummary(baseBranch, headBranch, failures, warnings = []) {
