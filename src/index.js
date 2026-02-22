@@ -10,6 +10,15 @@ const PR_COMPLIANCE_RECHECK_LABEL = "compliance:recheck";
 const PR_AUTOCLOSE_MARKER = "<!-- kumpeapps-issue-autoclose -->";
 const DEFAULT_BRANCH_RULESET_NAME = "KumpeApps Default Branch Compliance";
 const MERGE_QUEUE_REBASE_METHOD = "REBASE";
+const DEFAULT_MERGE_QUEUE_PARAMETERS = {
+  check_response_timeout_minutes: 60,
+  grouping_strategy: "HEADGREEN",
+  max_entries_to_build: 5,
+  max_entries_to_merge: 5,
+  merge_method: MERGE_QUEUE_REBASE_METHOD,
+  min_entries_to_merge: 1,
+  min_entries_to_merge_wait_minutes: 5,
+};
 const SEVERITY_RANK = {
   low: 1,
   medium: 2,
@@ -1726,16 +1735,12 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
 
     const rulesetToRemediate = findRulesetForComplianceRemediation(rulesets, defaultBranch);
     if (rulesetToRemediate?.id) {
-      await context.octokit.request("PUT /repos/{owner}/{repo}/rulesets/{ruleset_id}", {
+      await upsertExistingComplianceRuleset(context, {
         owner,
         repo,
-        ruleset_id: rulesetToRemediate.id,
-        name: rulesetToRemediate.name || DEFAULT_BRANCH_RULESET_NAME,
-        target: "branch",
-        enforcement: "active",
-        conditions: buildDefaultBranchConditions(rulesetToRemediate.conditions, defaultBranch),
-        rules: buildComplianceRules(rulesetToRemediate.rules, policy),
-        bypass_actors: Array.isArray(rulesetToRemediate.bypass_actors) ? rulesetToRemediate.bypass_actors : [],
+        defaultBranch,
+        ruleset: rulesetToRemediate,
+        policy,
       });
 
       RULESET_ENFORCEMENT_CACHE.add(cacheKey);
@@ -1746,21 +1751,7 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
       return;
     }
 
-    await context.octokit.request("POST /repos/{owner}/{repo}/rulesets", {
-      owner,
-      repo,
-      name: DEFAULT_BRANCH_RULESET_NAME,
-      target: "branch",
-      enforcement: "active",
-      conditions: {
-        ref_name: {
-          include: ["~DEFAULT_BRANCH"],
-          exclude: [],
-        },
-      },
-      rules: buildComplianceRules([], policy),
-      bypass_actors: [],
-    });
+    await createComplianceRuleset(context, { owner, repo, policy });
 
     RULESET_ENFORCEMENT_CACHE.add(cacheKey);
     context.log.info(
@@ -1779,6 +1770,38 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
       "Unable to ensure default-branch compliance ruleset"
     );
   }
+}
+
+async function upsertExistingComplianceRuleset(context, { owner, repo, defaultBranch, ruleset, policy }) {
+  await context.octokit.request("PUT /repos/{owner}/{repo}/rulesets/{ruleset_id}", {
+    owner,
+    repo,
+    ruleset_id: ruleset.id,
+    name: ruleset.name || DEFAULT_BRANCH_RULESET_NAME,
+    target: "branch",
+    enforcement: "active",
+    conditions: buildDefaultBranchConditions(ruleset.conditions, defaultBranch),
+    rules: buildComplianceRules(ruleset.rules, policy),
+    bypass_actors: Array.isArray(ruleset.bypass_actors) ? ruleset.bypass_actors : [],
+  });
+}
+
+async function createComplianceRuleset(context, { owner, repo, policy }) {
+  await context.octokit.request("POST /repos/{owner}/{repo}/rulesets", {
+    owner,
+    repo,
+    name: DEFAULT_BRANCH_RULESET_NAME,
+    target: "branch",
+    enforcement: "active",
+    conditions: {
+      ref_name: {
+        include: ["~DEFAULT_BRANCH"],
+        exclude: [],
+      },
+    },
+    rules: buildComplianceRules([], policy),
+    bypass_actors: [],
+  });
 }
 
 function isRulesetEnforcingComplianceRequirements(ruleset, defaultBranch, policy) {
@@ -1906,13 +1929,76 @@ function buildComplianceRules(existingRules, policy) {
     passthroughRules.push({
       type: "merge_queue",
       parameters: {
-        ...mergeQueueRule?.parameters,
-        merge_method: normalizeMergeQueueMethod(policy?.enforcement?.mergeQueueMethod),
+        ...buildMergeQueueParameters(mergeQueueRule?.parameters, policy?.enforcement?.mergeQueueMethod),
       },
     });
   }
 
   return passthroughRules;
+}
+
+function buildMergeQueueParameters(existingParameters, configuredMergeMethod) {
+  const params = existingParameters && typeof existingParameters === "object" ? existingParameters : {};
+  return {
+    check_response_timeout_minutes: normalizeIntegerInRange(
+      params.check_response_timeout_minutes,
+      1,
+      360,
+      DEFAULT_MERGE_QUEUE_PARAMETERS.check_response_timeout_minutes
+    ),
+    grouping_strategy: normalizeMergeQueueGroupingStrategy(params.grouping_strategy),
+    max_entries_to_build: normalizeIntegerInRange(
+      params.max_entries_to_build,
+      0,
+      100,
+      DEFAULT_MERGE_QUEUE_PARAMETERS.max_entries_to_build
+    ),
+    max_entries_to_merge: normalizeIntegerInRange(
+      params.max_entries_to_merge,
+      0,
+      100,
+      DEFAULT_MERGE_QUEUE_PARAMETERS.max_entries_to_merge
+    ),
+    merge_method: normalizeMergeQueueMethod(configuredMergeMethod || params.merge_method),
+    min_entries_to_merge: normalizeIntegerInRange(
+      params.min_entries_to_merge,
+      0,
+      100,
+      DEFAULT_MERGE_QUEUE_PARAMETERS.min_entries_to_merge
+    ),
+    min_entries_to_merge_wait_minutes: normalizeIntegerInRange(
+      params.min_entries_to_merge_wait_minutes,
+      0,
+      360,
+      DEFAULT_MERGE_QUEUE_PARAMETERS.min_entries_to_merge_wait_minutes
+    ),
+  };
+}
+
+function normalizeMergeQueueGroupingStrategy(value) {
+  const normalized = String(value || DEFAULT_MERGE_QUEUE_PARAMETERS.grouping_strategy)
+    .trim()
+    .toUpperCase();
+  return ["ALLGREEN", "HEADGREEN"].includes(normalized)
+    ? normalized
+    : DEFAULT_MERGE_QUEUE_PARAMETERS.grouping_strategy;
+}
+
+function normalizeIntegerInRange(value, min, max, fallback) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed)) {
+    return fallback;
+  }
+
+  if (parsed < min) {
+    return min;
+  }
+
+  if (parsed > max) {
+    return max;
+  }
+
+  return parsed;
 }
 
 function isRebasePolicyBackfillEnabled() {
