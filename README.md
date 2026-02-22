@@ -15,8 +15,12 @@ On `issues.opened`:
 
 On `issues.assigned`:
 - Ensures issue has Type (`bug|feature|task`).
-- Creates branch from `dev`, else `main`, else `master`.
+- Creates a linked branch from `dev`, else `main`, else `master`.
 - Branch format: `type/issue_number` (example: `bug/12`).
+- Linked branch appears under the issue Development section (same behavior as GitHub UI "Create branch").
+
+On `create` (branch created):
+- If branch matches `type/issue_number` and the referenced issue is open, bot attempts to attach it to that issue’s Development section.
 
 ### Pull requests
 
@@ -91,6 +95,7 @@ https://YOUR_PUBLIC_DOMAIN[:PORT]/api/github/webhooks
    - `issues`
    - `issue_comment`
    - `pull_request`
+  - `create`
 6. Create app and download private key (`.pem`).
 7. Note your `APP_ID`.
 

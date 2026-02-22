@@ -139,26 +139,75 @@ module.exports = (app) => {
         ref: `heads/${baseBranch}`,
       });
 
-      await context.octokit.git.createRef({
-        owner,
-        repo,
-        ref: `refs/heads/${branchName}`,
-        sha: baseRef.data.object.sha,
+      const linkedBranchCreated = await createLinkedBranchForIssue(context, {
+        issueNodeId: issue.node_id,
+        repositoryNodeId: repository.node_id,
+        branchName,
+        baseOid: baseRef.data.object.sha,
       });
+
+      if (!linkedBranchCreated) {
+        await context.octokit.git.createRef({
+          owner,
+          repo,
+          ref: `refs/heads/${branchName}`,
+          sha: baseRef.data.object.sha,
+        });
+      }
 
       await context.octokit.issues.createComment(
         context.issue({
-          body: `Created branch \`${branchName}\` from \`${baseBranch}\`. Please resolve this issue under that branch.`,
+          body: linkedBranchCreated
+            ? `Created linked branch \`${branchName}\` from \`${baseBranch}\`. It is now attached in the issue Development section.`
+            : `Created branch \`${branchName}\` from \`${baseBranch}\`. Please resolve this issue under that branch.`,
         })
       );
       return;
     }
 
+    const linkedExistingBranch = await linkExistingBranchToIssue(context, {
+      owner,
+      repo,
+      issueNodeId: issue.node_id,
+      repositoryNodeId: repository.node_id,
+      branchName,
+    });
+
     await context.octokit.issues.createComment(
       context.issue({
-        body: `Branch \`${branchName}\` already exists. Please resolve this issue under that branch.`,
+        body: linkedExistingBranch
+          ? `Branch \`${branchName}\` already exists and is linked in Development. Please resolve this issue under that branch.`
+          : `Branch \`${branchName}\` already exists. Please resolve this issue under that branch.`,
       })
     );
+  });
+
+  app.on("create", async (context) => {
+    const { repository, ref, ref_type: refType } = context.payload;
+    if (refType !== "branch") {
+      return;
+    }
+
+    const parsedBranch = parseTypeIssueBranch(ref);
+    if (!parsedBranch) {
+      return;
+    }
+
+    const owner = repository.owner.login;
+    const repo = repository.name;
+    const issueNodeId = await getOpenIssueNodeId(context, owner, repo, parsedBranch.issueNumber);
+
+    if (!issueNodeId) {
+      return;
+    }
+
+    await linkExistingBranchToIssue(context, {
+      owner,
+      repo,
+      issueNodeId,
+      repositoryNodeId: repository.node_id,
+      branchName: ref,
+    });
   });
 
   app.on(
@@ -1226,5 +1275,95 @@ async function doesBranchExist(context, owner, repo, branch) {
     }
 
     throw error;
+  }
+}
+
+async function getBranchHeadSha(context, owner, repo, branchName) {
+  try {
+    const result = await context.octokit.repos.getBranch({
+      owner,
+      repo,
+      branch: branchName,
+    });
+
+    return result?.data?.commit?.sha || null;
+  } catch (error) {
+    context.log.warn({ error }, "Unable to read branch head SHA");
+    return null;
+  }
+}
+
+async function createLinkedBranchForIssue(context, { issueNodeId, repositoryNodeId, branchName, baseOid }) {
+  try {
+    await context.octokit.graphql(
+      `
+        mutation ($issueId: ID!, $repositoryId: ID, $name: String!, $oid: GitObjectID!) {
+          createLinkedBranch(
+            input: {
+              issueId: $issueId
+              repositoryId: $repositoryId
+              name: $name
+              oid: $oid
+            }
+          ) {
+            linkedBranch {
+              id
+            }
+          }
+        }
+      `,
+      {
+        issueId: issueNodeId,
+        repositoryId: repositoryNodeId,
+        name: branchName,
+        oid: baseOid,
+      }
+    );
+
+    return true;
+  } catch (error) {
+    context.log.warn({ error }, "Unable to create linked branch via GraphQL");
+    return false;
+  }
+}
+
+async function linkExistingBranchToIssue(context, { owner, repo, issueNodeId, repositoryNodeId, branchName }) {
+  const branchHeadSha = await getBranchHeadSha(context, owner, repo, branchName);
+  if (!branchHeadSha) {
+    return false;
+  }
+
+  return createLinkedBranchForIssue(context, {
+    issueNodeId,
+    repositoryNodeId,
+    branchName,
+    baseOid: branchHeadSha,
+  });
+}
+
+async function getOpenIssueNodeId(context, owner, repo, issueNumber) {
+  try {
+    const result = await context.octokit.issues.get({
+      owner,
+      repo,
+      issue_number: issueNumber,
+    });
+
+    if (result?.data?.pull_request) {
+      return null;
+    }
+
+    if (normalizeType(result?.data?.state) !== "open") {
+      return null;
+    }
+
+    return result?.data?.node_id || null;
+  } catch (error) {
+    if (error.status === 404) {
+      return null;
+    }
+
+    context.log.warn({ error }, "Unable to read issue while linking branch");
+    return null;
   }
 }
