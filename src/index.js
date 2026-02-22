@@ -41,6 +41,9 @@ const TYPE_KEYWORDS = {
 
 const RULESET_ENFORCEMENT_CACHE = new Set();
 const RULESET_UNSUPPORTED_CACHE = new Set();
+const RULESET_MERGE_QUEUE_UNSUPPORTED_CACHE = new Set();
+const MERGE_GROUP_SNAPSHOT_ERROR_CACHE = new Map();
+const MERGE_GROUP_SNAPSHOT_MAX_PENDING_ERRORS = 3;
 const REPO_POLICY_CACHE = new Map();
 const REPO_POLICY_CACHE_TTL_MS = 60 * 1000;
 const REPO_POLICY_PATHS = [".github/kumpeapps-bot.yml", ".github/kumpeapps-bot.yaml"];
@@ -1426,7 +1429,7 @@ async function evaluateMergeGroupCompliance(context, owner, repo) {
     return;
   }
 
-  const pullNumbers = extractMergeGroupPullRequestNumbers(context.payload);
+  const pullNumbers = extractMergeGroupPullRequestNumbers(context, context.payload);
 
   if (pullNumbers.length === 0) {
     await publishPullRequestComplianceCheck(context, {
@@ -1497,13 +1500,33 @@ async function evaluateMergeGroupCompliance(context, owner, repo) {
   });
 }
 
-function extractMergeGroupPullRequestNumbers(payload) {
+function extractMergeGroupPullRequestNumbers(context, payload) {
   const mergeGroupPullRequests = Array.isArray(payload?.merge_group?.pull_requests) ? payload.merge_group.pull_requests : [];
   const rootPullRequests = Array.isArray(payload?.pull_requests) ? payload.pull_requests : [];
+  const allReferences = [...mergeGroupPullRequests, ...rootPullRequests];
 
-  const numbers = [...mergeGroupPullRequests, ...rootPullRequests]
-    .map((pull) => Number(pull?.number || 0))
-    .filter((number) => Number.isInteger(number) && number > 0);
+  const numbers = [];
+  const skipped = [];
+
+  for (const reference of allReferences) {
+    const parsedNumber = Number(reference?.number || 0);
+    if (Number.isInteger(parsedNumber) && parsedNumber > 0) {
+      numbers.push(parsedNumber);
+      continue;
+    }
+
+    skipped.push(reference);
+  }
+
+  if (skipped.length > 0) {
+    context.log.debug(
+      {
+        skippedCount: skipped.length,
+        sample: skipped.slice(0, 3),
+      },
+      "Skipped malformed pull request references in merge_group payload"
+    );
+  }
 
   return [...new Set(numbers)];
 }
@@ -1520,6 +1543,7 @@ async function getPullRequestComplianceSnapshot(context, owner, repo, pullNumber
     const complianceConclusion = await getComplianceConclusionForRef(context, owner, repo, pullRequest.head.sha);
 
     if (complianceConclusion === "success") {
+      clearMergeGroupSnapshotError(context, owner, repo, pullNumber);
       return {
         pullNumber,
         state: "pass",
@@ -1528,6 +1552,7 @@ async function getPullRequestComplianceSnapshot(context, owner, repo, pullNumber
     }
 
     if (["failure", "cancelled", "timed_out", "action_required"].includes(complianceConclusion)) {
+      clearMergeGroupSnapshotError(context, owner, repo, pullNumber);
       return {
         pullNumber,
         state: "fail",
@@ -1536,6 +1561,7 @@ async function getPullRequestComplianceSnapshot(context, owner, repo, pullNumber
     }
 
     if (complianceConclusion === "pending") {
+      clearMergeGroupSnapshotError(context, owner, repo, pullNumber);
       return {
         pullNumber,
         state: "pending",
@@ -1545,6 +1571,7 @@ async function getPullRequestComplianceSnapshot(context, owner, repo, pullNumber
 
     const labels = Array.isArray(pullRequest.labels) ? pullRequest.labels.map((label) => normalizeType(label?.name)) : [];
     if (labels.includes(PR_COMPLIANCE_FAIL_LABEL)) {
+      clearMergeGroupSnapshotError(context, owner, repo, pullNumber);
       return {
         pullNumber,
         state: "fail",
@@ -1553,6 +1580,7 @@ async function getPullRequestComplianceSnapshot(context, owner, repo, pullNumber
     }
 
     if (labels.includes(PR_COMPLIANCE_PASS_LABEL)) {
+      clearMergeGroupSnapshotError(context, owner, repo, pullNumber);
       return {
         pullNumber,
         state: "pass",
@@ -1560,6 +1588,7 @@ async function getPullRequestComplianceSnapshot(context, owner, repo, pullNumber
       };
     }
 
+    clearMergeGroupSnapshotError(context, owner, repo, pullNumber);
     return {
       pullNumber,
       state: "pending",
@@ -1567,11 +1596,58 @@ async function getPullRequestComplianceSnapshot(context, owner, repo, pullNumber
     };
   } catch (error) {
     context.log.warn({ error, owner, repo, pullNumber }, "Unable to evaluate PR compliance snapshot for merge queue");
+
+    const errorState = registerMergeGroupSnapshotError(context, owner, repo, pullNumber, error);
+    if (errorState.count >= MERGE_GROUP_SNAPSHOT_MAX_PENDING_ERRORS) {
+      return {
+        pullNumber,
+        state: "fail",
+        reason: `Unable to read PR compliance state due to repeated API errors (${errorState.count} consecutive attempts).`,
+      };
+    }
+
     return {
       pullNumber,
       state: "pending",
-      reason: "Unable to read PR compliance state due to API error.",
+      reason: `Unable to read PR compliance state due to API error (${errorState.count}/${MERGE_GROUP_SNAPSHOT_MAX_PENDING_ERRORS}).`,
     };
+  }
+}
+
+function buildMergeGroupSnapshotErrorCacheKey(owner, repo, pullNumber) {
+  return `${buildRepositoryCacheKey(owner, repo)}#${Number(pullNumber || 0)}`;
+}
+
+function registerMergeGroupSnapshotError(context, owner, repo, pullNumber, error) {
+  const cacheKey = buildMergeGroupSnapshotErrorCacheKey(owner, repo, pullNumber);
+  const previous = MERGE_GROUP_SNAPSHOT_ERROR_CACHE.get(cacheKey);
+  const count = Number(previous?.count || 0) + 1;
+  const state = {
+    count,
+    updatedAt: Date.now(),
+  };
+
+  MERGE_GROUP_SNAPSHOT_ERROR_CACHE.set(cacheKey, state);
+  context.log.warn(
+    {
+      owner,
+      repo,
+      pullNumber,
+      count,
+      status: error?.status,
+      message: error?.message,
+    },
+    "Merge-group PR compliance snapshot API error"
+  );
+
+  return state;
+}
+
+function clearMergeGroupSnapshotError(context, owner, repo, pullNumber) {
+  const cacheKey = buildMergeGroupSnapshotErrorCacheKey(owner, repo, pullNumber);
+  if (MERGE_GROUP_SNAPSHOT_ERROR_CACHE.has(cacheKey)) {
+    MERGE_GROUP_SNAPSHOT_ERROR_CACHE.delete(cacheKey);
+    context.log.debug({ owner, repo, pullNumber }, "Cleared merge-group PR compliance snapshot error counter");
   }
 }
 
@@ -2179,6 +2255,7 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
   }
 
   const cacheKey = buildRepositoryCacheKey(owner, repo);
+  const effectivePolicy = getRulesetEffectivePolicyForRepository(cacheKey, policy);
   if (RULESET_UNSUPPORTED_CACHE.has(cacheKey)) {
     return;
   }
@@ -2208,7 +2285,9 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
       per_page: 100,
     });
 
-    const alreadyCovered = rulesets.some((ruleset) => isRulesetEnforcingComplianceRequirements(ruleset, defaultBranch, policy));
+    const alreadyCovered = rulesets.some((ruleset) =>
+      isRulesetEnforcingComplianceRequirements(ruleset, defaultBranch, effectivePolicy)
+    );
     if (alreadyCovered) {
       RULESET_ENFORCEMENT_CACHE.add(cacheKey);
       return;
@@ -2216,12 +2295,24 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
 
     const rulesetToRemediate = findRulesetForComplianceRemediation(rulesets, defaultBranch);
     if (rulesetToRemediate?.id) {
-      await upsertExistingComplianceRuleset(context, {
-        owner,
-        repo,
-        defaultBranch,
-        ruleset: rulesetToRemediate,
+      await withMergeQueueFallback({
+        context,
+        cacheKey,
         policy,
+        effectivePolicy,
+        apply: (policyToApply) =>
+          upsertExistingComplianceRuleset(context, {
+            owner,
+            repo,
+            defaultBranch,
+            ruleset: rulesetToRemediate,
+            policy: policyToApply,
+          }),
+        onFallbackLog: () =>
+          context.log.warn(
+            { owner, repo, defaultBranch, rulesetId: rulesetToRemediate.id },
+            "Merge queue rule unsupported for repository ruleset; applied fallback without merge queue requirement"
+          ),
       });
 
       RULESET_ENFORCEMENT_CACHE.add(cacheKey);
@@ -2232,7 +2323,18 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
       return;
     }
 
-    await createComplianceRuleset(context, { owner, repo, policy });
+    await withMergeQueueFallback({
+      context,
+      cacheKey,
+      policy,
+      effectivePolicy,
+      apply: (policyToApply) => createComplianceRuleset(context, { owner, repo, policy: policyToApply }),
+      onFallbackLog: () =>
+        context.log.warn(
+          { owner, repo, defaultBranch },
+          "Merge queue rule unsupported for repository ruleset; created fallback ruleset without merge queue requirement"
+        ),
+    });
 
     RULESET_ENFORCEMENT_CACHE.add(cacheKey);
     context.log.info(
@@ -2267,6 +2369,38 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
   }
 }
 
+function getRulesetEffectivePolicyForRepository(cacheKey, policy) {
+  if (!RULESET_MERGE_QUEUE_UNSUPPORTED_CACHE.has(cacheKey)) {
+    return policy;
+  }
+
+  return {
+    ...policy,
+    enforcement: {
+      ...(policy?.enforcement || {}),
+      requireMergeQueue: false,
+    },
+  };
+}
+
+async function withMergeQueueFallback({ context, cacheKey, policy, effectivePolicy, apply, onFallbackLog }) {
+  try {
+    await apply(effectivePolicy);
+  } catch (error) {
+    if (effectivePolicy?.enforcement?.requireMergeQueue && isMergeQueueRuleUnsupported(error)) {
+      RULESET_MERGE_QUEUE_UNSUPPORTED_CACHE.add(cacheKey);
+      const fallbackPolicy = getRulesetEffectivePolicyForRepository(cacheKey, policy);
+      await apply(fallbackPolicy);
+      if (typeof onFallbackLog === "function") {
+        onFallbackLog();
+      }
+      return;
+    }
+
+    throw error;
+  }
+}
+
 function isRulesetFeatureUnavailable(error) {
   if (Number(error?.status) !== 403) {
     return false;
@@ -2280,6 +2414,46 @@ function isRulesetFeatureUnavailable(error) {
     (message.includes("make this repository public") && message.includes("enable this feature")) ||
     docsUrl.includes("/rest/repos/rules")
   );
+}
+
+function isMergeQueueRuleUnsupported(error) {
+  if (Number(error?.status) !== 422) {
+    return false;
+  }
+
+  const errors = Array.isArray(error?.response?.data?.errors) ? error.response.data.errors : [];
+
+  const hasStructuredMergeQueueSignal = errors.some((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return false;
+    }
+
+    const entryField = normalizeType(entry.field);
+    const entryCode = normalizeType(entry.code);
+    const entryResource = normalizeType(entry.resource);
+    const entryType = normalizeType(entry.type);
+    const entryMessage = normalizeType(entry.message);
+
+    const fieldHintsMergeQueue =
+      entryField.includes("merge_queue") || entryField.includes("rules") || entryType.includes("merge_queue");
+    const messageHintsMergeQueue = entryMessage.includes("merge_queue") || entryMessage.includes("invalid rule");
+    const knownInvalidCode = ["invalid", "unprocessable", "custom"].includes(entryCode);
+    const resourceHintsRule = entryResource === "repositoryrule" || entryResource === "ruleset" || entryResource === "rule";
+
+    return (fieldHintsMergeQueue || messageHintsMergeQueue) && (knownInvalidCode || resourceHintsRule || Boolean(entryMessage));
+  });
+
+  if (hasStructuredMergeQueueSignal) {
+    return true;
+  }
+
+  const message = String(error?.response?.data?.message || error?.message || "").toLowerCase();
+  const serializedErrors = errors
+    .map((entry) => (typeof entry === "string" ? entry : JSON.stringify(entry)))
+    .join(" ")
+    .toLowerCase();
+
+  return message.includes("validation failed") && serializedErrors.includes("merge_queue");
 }
 
 async function upsertExistingComplianceRuleset(context, { owner, repo, defaultBranch, ruleset, policy }) {
@@ -2670,7 +2844,15 @@ function clearRepositoryCaches(owner, repo) {
   const cacheKey = buildRepositoryCacheKey(owner, repo);
   RULESET_ENFORCEMENT_CACHE.delete(cacheKey);
   RULESET_UNSUPPORTED_CACHE.delete(cacheKey);
+  RULESET_MERGE_QUEUE_UNSUPPORTED_CACHE.delete(cacheKey);
   REPO_POLICY_CACHE.delete(cacheKey);
+
+  const snapshotErrorPrefix = `${cacheKey}#`;
+  for (const key of MERGE_GROUP_SNAPSHOT_ERROR_CACHE.keys()) {
+    if (key.startsWith(snapshotErrorPrefix)) {
+      MERGE_GROUP_SNAPSHOT_ERROR_CACHE.delete(key);
+    }
+  }
 }
 
 function isRepositoryArchived(repository) {
