@@ -179,6 +179,7 @@ https://YOUR_PUBLIC_DOMAIN[:PORT]/api/github/webhooks
    - `issues`
    - `issue_comment`
    - `pull_request`
+  - `merge_group`
   - `installation`
   - `installation_repositories`
   - `create`

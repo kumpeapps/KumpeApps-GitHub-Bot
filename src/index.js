@@ -330,6 +330,25 @@ module.exports = (app) => {
     }
   );
 
+  app.on("merge_group.checks_requested", async (context) => {
+    const { repository } = context.payload;
+    const owner = repository?.owner?.login;
+    const repo = repository?.name;
+
+    if (!owner || !repo) {
+      context.log.warn({ payload: context.payload }, "Skipping merge_group handling due to missing owner/repo");
+      return;
+    }
+
+    if (isRepositoryArchived(repository)) {
+      logArchivedRepositorySkip(context.log, owner, repo, "merge_group.checks_requested");
+      return;
+    }
+
+    await ensureRepositoryBaselineCompliance(context, owner, repo, repository);
+    await evaluateMergeGroupCompliance(context, owner, repo);
+  });
+
   app.on(["pull_request.unlabeled", "pull_request.labeled"], async (context) => {
     const { pull_request: pullRequest, repository, action, label } = context.payload;
     if (isRepositoryArchived(repository)) {
@@ -1358,25 +1377,32 @@ async function upsertDependabotGreetingComment(context) {
 }
 
 async function publishPullRequestComplianceCheck(context, { owner, repo, headSha, conclusion, title, summary }) {
+  const checkStatus = conclusion ? "completed" : "in_progress";
+
   try {
-    await context.octokit.checks.create({
+    const payload = {
       owner,
       repo,
       name: PR_CHECK_NAME,
       head_sha: headSha,
-      status: "completed",
-      conclusion,
+      status: checkStatus,
       output: {
         title,
         summary,
       },
-    });
+    };
+
+    if (checkStatus === "completed") {
+      payload.conclusion = conclusion;
+    }
+
+    await context.octokit.checks.create(payload);
     return;
   } catch (error) {
     context.log.warn({ error }, "Unable to publish check run");
   }
 
-  const state = conclusion === "success" ? "success" : "failure";
+  const state = checkStatus === "in_progress" ? "pending" : conclusion === "success" ? "success" : "failure";
   try {
     await context.octokit.repos.createCommitStatus({
       owner,
@@ -1389,6 +1415,221 @@ async function publishPullRequestComplianceCheck(context, { owner, repo, headSha
   } catch (error) {
     context.log.warn({ error }, "Unable to publish commit status");
   }
+}
+
+async function evaluateMergeGroupCompliance(context, owner, repo) {
+  const mergeGroup = context.payload?.merge_group;
+  const mergeGroupSha = mergeGroup?.head_sha;
+
+  if (!mergeGroupSha) {
+    context.log.warn({ payload: context.payload }, "merge_group payload missing head_sha");
+    return;
+  }
+
+  const pullNumbers = extractMergeGroupPullRequestNumbers(context.payload);
+
+  if (pullNumbers.length === 0) {
+    await publishPullRequestComplianceCheck(context, {
+      owner,
+      repo,
+      headSha: mergeGroupSha,
+      conclusion: "success",
+      title: "Compliance checks passed",
+      summary: "Merge queue group has no associated pull requests in payload; reporting compliance success.",
+    });
+    return;
+  }
+
+  const results = await Promise.all(
+    pullNumbers.map((pullNumber) => getPullRequestComplianceSnapshot(context, owner, repo, pullNumber))
+  );
+
+  const failedResults = results.filter((result) => result.state === "fail");
+  const pendingResults = results.filter((result) => result.state === "pending");
+
+  if (failedResults.length > 0) {
+    const failureLines = failedResults.map(
+      (result) => `- #${result.pullNumber}: ${result.reason || "Compliance status is missing or not successful."}`
+    );
+
+    const pendingLines = pendingResults.map(
+      (result) => `- #${result.pullNumber}: ${result.reason || "Compliance check is still in progress."}`
+    );
+
+    await publishPullRequestComplianceCheck(context, {
+      owner,
+      repo,
+      headSha: mergeGroupSha,
+      conclusion: "failure",
+      title: "Compliance checks failed",
+      summary: [
+        "Merge queue compliance failed because one or more PRs are not compliant:",
+        "",
+        ...failureLines,
+        ...(pendingLines.length > 0 ? ["", "Additional checks still in progress:", ...pendingLines] : []),
+      ].join("\n"),
+    });
+    return;
+  }
+
+  if (pendingResults.length > 0) {
+    const pendingLines = pendingResults.map(
+      (result) => `- #${result.pullNumber}: ${result.reason || "Compliance check is still in progress."}`
+    );
+
+    await publishPullRequestComplianceCheck(context, {
+      owner,
+      repo,
+      headSha: mergeGroupSha,
+      title: "Compliance checks in progress",
+      summary: ["Merge queue compliance is waiting for PR compliance checks to complete:", "", ...pendingLines].join("\n"),
+    });
+    return;
+  }
+
+  await publishPullRequestComplianceCheck(context, {
+    owner,
+    repo,
+    headSha: mergeGroupSha,
+    conclusion: "success",
+    title: "Compliance checks passed",
+    summary: `All associated PRs are compliant: ${pullNumbers.map((number) => `#${number}`).join(", ")}.`,
+  });
+}
+
+function extractMergeGroupPullRequestNumbers(payload) {
+  const mergeGroupPullRequests = Array.isArray(payload?.merge_group?.pull_requests) ? payload.merge_group.pull_requests : [];
+  const rootPullRequests = Array.isArray(payload?.pull_requests) ? payload.pull_requests : [];
+
+  const numbers = [...mergeGroupPullRequests, ...rootPullRequests]
+    .map((pull) => Number(pull?.number || 0))
+    .filter((number) => Number.isInteger(number) && number > 0);
+
+  return [...new Set(numbers)];
+}
+
+async function getPullRequestComplianceSnapshot(context, owner, repo, pullNumber) {
+  try {
+    const pullResponse = await context.octokit.pulls.get({
+      owner,
+      repo,
+      pull_number: pullNumber,
+    });
+
+    const pullRequest = pullResponse.data;
+    const complianceConclusion = await getComplianceConclusionForRef(context, owner, repo, pullRequest.head.sha);
+
+    if (complianceConclusion === "success") {
+      return {
+        pullNumber,
+        state: "pass",
+        reason: "Compliance check passed.",
+      };
+    }
+
+    if (["failure", "cancelled", "timed_out", "action_required"].includes(complianceConclusion)) {
+      return {
+        pullNumber,
+        state: "fail",
+        reason: `Compliance check conclusion is \`${complianceConclusion}\`.`,
+      };
+    }
+
+    if (complianceConclusion === "pending") {
+      return {
+        pullNumber,
+        state: "pending",
+        reason: "Compliance check is still pending.",
+      };
+    }
+
+    const labels = Array.isArray(pullRequest.labels) ? pullRequest.labels.map((label) => normalizeType(label?.name)) : [];
+    if (labels.includes(PR_COMPLIANCE_FAIL_LABEL)) {
+      return {
+        pullNumber,
+        state: "fail",
+        reason: `Label \`${PR_COMPLIANCE_FAIL_LABEL}\` is present on the PR.`,
+      };
+    }
+
+    if (labels.includes(PR_COMPLIANCE_PASS_LABEL)) {
+      return {
+        pullNumber,
+        state: "pass",
+        reason: `Label \`${PR_COMPLIANCE_PASS_LABEL}\` is present on the PR.`,
+      };
+    }
+
+    return {
+      pullNumber,
+      state: "pending",
+      reason: "No completed compliance check run/status found on the PR head commit yet.",
+    };
+  } catch (error) {
+    context.log.warn({ error, owner, repo, pullNumber }, "Unable to evaluate PR compliance snapshot for merge queue");
+    return {
+      pullNumber,
+      state: "pending",
+      reason: "Unable to read PR compliance state due to API error.",
+    };
+  }
+}
+
+async function getComplianceConclusionForRef(context, owner, repo, sha) {
+  try {
+    const checksResponse = await context.octokit.checks.listForRef({
+      owner,
+      repo,
+      ref: sha,
+      per_page: 100,
+    });
+
+    const matchingChecks = (checksResponse?.data?.check_runs || []).filter(
+      (check) => normalizeType(check?.name) === normalizeType(PR_CHECK_NAME)
+    );
+
+    if (matchingChecks.length > 0) {
+      const latestCheck = matchingChecks
+        .slice()
+        .sort((left, right) => new Date(right?.completed_at || right?.started_at || 0) - new Date(left?.completed_at || left?.started_at || 0))[0];
+
+      if (latestCheck?.status === "completed") {
+        return normalizeType(latestCheck?.conclusion);
+      }
+    }
+  } catch (error) {
+    context.log.warn({ error, owner, repo, sha }, "Unable to list check runs while resolving compliance conclusion");
+  }
+
+  try {
+    const statusesResponse = await context.octokit.repos.listCommitStatusesForRef({
+      owner,
+      repo,
+      ref: sha,
+      per_page: 100,
+    });
+
+    const status = (statusesResponse?.data || []).find(
+      (item) => normalizeType(item?.context) === normalizeType(PR_CHECK_NAME)
+    );
+
+    if (status) {
+      const state = normalizeType(status.state);
+      if (state === "success") {
+        return "success";
+      }
+      if (state === "failure" || state === "error") {
+        return "failure";
+      }
+      if (state === "pending") {
+        return "pending";
+      }
+    }
+  } catch (error) {
+    context.log.warn({ error, owner, repo, sha }, "Unable to list commit statuses while resolving compliance conclusion");
+  }
+
+  return null;
 }
 
 async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepository, policy, pullRequest) {
