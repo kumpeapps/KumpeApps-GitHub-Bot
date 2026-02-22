@@ -47,6 +47,19 @@ const MERGE_GROUP_SNAPSHOT_MAX_PENDING_ERRORS = 3;
 const REPO_POLICY_CACHE = new Map();
 const REPO_POLICY_CACHE_TTL_MS = 60 * 1000;
 const REPO_POLICY_PATHS = [".github/kumpeapps-bot.yml", ".github/kumpeapps-bot.yaml"];
+const WEBHOOK_RECOVERY_DEFAULT_INTERVAL_MINUTES = 5;
+const WEBHOOK_RECOVERY_DEFAULT_LOOKBACK_HOURS = 24;
+const WEBHOOK_RECOVERY_DEFAULT_MAX_ATTEMPTS = 3;
+const WEBHOOK_RECOVERY_MIN_INTERVAL_MINUTES = 1;
+const WEBHOOK_RECOVERY_MAX_INTERVAL_MINUTES = 1440;
+const WEBHOOK_RECOVERY_MIN_LOOKBACK_HOURS = 1;
+const WEBHOOK_RECOVERY_MAX_LOOKBACK_HOURS = 168;
+const WEBHOOK_RECOVERY_MIN_MAX_ATTEMPTS = 1;
+const WEBHOOK_RECOVERY_MAX_MAX_ATTEMPTS = 10;
+const WEBHOOK_RECOVERY_ATTEMPT_CACHE = new Map();
+let WEBHOOK_RECOVERY_TIMER = null;
+let WEBHOOK_RECOVERY_RUNNING = false;
+let WEBHOOK_RECOVERY_UNSUPPORTED = false;
 const LOCAL_SECRET_SCANNER_RULE_NAME = "Local secret scanner";
 const LOCAL_SECRET_SCANNER_ALLOW_MARKER = "kumpeapps:allow-secret";
 const LOCAL_SECRET_SCAN_MAX_FILE_BYTES = 250_000;
@@ -442,6 +455,10 @@ module.exports = (app) => {
 
   if (isRebasePolicyBackfillEnabled()) {
     void backfillRebaseOnlyMergePolicy(app);
+  }
+
+  if (isWebhookRecoveryEnabled()) {
+    startWebhookRecoveryWorker(app);
   }
 };
 
@@ -3147,6 +3164,249 @@ function normalizeIntegerInRange(value, min, max, fallback) {
 
 function isRebasePolicyBackfillEnabled() {
   return normalizeType(process.env.REBASE_POLICY_BACKFILL_ON_STARTUP || "true") !== "false";
+}
+
+function isWebhookRecoveryEnabled() {
+  return normalizeType(process.env.WEBHOOK_RECOVERY_ENABLED || "false") === "true";
+}
+
+function getWebhookRecoveryConfig() {
+  const intervalMinutes = normalizeIntegerInRange(
+    process.env.WEBHOOK_RECOVERY_INTERVAL_MINUTES,
+    WEBHOOK_RECOVERY_MIN_INTERVAL_MINUTES,
+    WEBHOOK_RECOVERY_MAX_INTERVAL_MINUTES,
+    WEBHOOK_RECOVERY_DEFAULT_INTERVAL_MINUTES
+  );
+  const lookbackHours = normalizeIntegerInRange(
+    process.env.WEBHOOK_RECOVERY_LOOKBACK_HOURS,
+    WEBHOOK_RECOVERY_MIN_LOOKBACK_HOURS,
+    WEBHOOK_RECOVERY_MAX_LOOKBACK_HOURS,
+    WEBHOOK_RECOVERY_DEFAULT_LOOKBACK_HOURS
+  );
+  const maxAttempts = normalizeIntegerInRange(
+    process.env.WEBHOOK_RECOVERY_MAX_ATTEMPTS,
+    WEBHOOK_RECOVERY_MIN_MAX_ATTEMPTS,
+    WEBHOOK_RECOVERY_MAX_MAX_ATTEMPTS,
+    WEBHOOK_RECOVERY_DEFAULT_MAX_ATTEMPTS
+  );
+
+  return {
+    intervalMinutes,
+    lookbackHours,
+    maxAttempts,
+    intervalMs: intervalMinutes * 60 * 1000,
+    lookbackMs: lookbackHours * 60 * 60 * 1000,
+  };
+}
+
+function startWebhookRecoveryWorker(app) {
+  if (WEBHOOK_RECOVERY_TIMER || WEBHOOK_RECOVERY_RUNNING) {
+    return;
+  }
+
+  const config = getWebhookRecoveryConfig();
+  app.log.info(
+    {
+      intervalMinutes: config.intervalMinutes,
+      lookbackHours: config.lookbackHours,
+      maxAttempts: config.maxAttempts,
+    },
+    "Starting webhook delivery recovery worker"
+  );
+
+  void runWebhookRecoveryLoop(app);
+}
+
+async function runWebhookRecoveryLoop(app) {
+  await runWebhookRecoverySweep(app);
+  scheduleNextWebhookRecoverySweep(app);
+}
+
+function scheduleNextWebhookRecoverySweep(app) {
+  if (WEBHOOK_RECOVERY_UNSUPPORTED || WEBHOOK_RECOVERY_TIMER) {
+    return;
+  }
+
+  const config = getWebhookRecoveryConfig();
+
+  WEBHOOK_RECOVERY_TIMER = setTimeout(() => {
+    WEBHOOK_RECOVERY_TIMER = null;
+    void runWebhookRecoveryLoop(app);
+  }, config.intervalMs);
+
+  if (typeof WEBHOOK_RECOVERY_TIMER?.unref === "function") {
+    WEBHOOK_RECOVERY_TIMER.unref();
+  }
+}
+
+async function runWebhookRecoverySweep(app) {
+  if (WEBHOOK_RECOVERY_UNSUPPORTED) {
+    return;
+  }
+
+  if (WEBHOOK_RECOVERY_RUNNING) {
+    app.log.warn("Skipping webhook recovery sweep because a previous run is still active");
+    return;
+  }
+
+  WEBHOOK_RECOVERY_RUNNING = true;
+
+  try {
+    const config = getWebhookRecoveryConfig();
+    pruneWebhookRecoveryAttemptCache(config.lookbackMs);
+
+    const appOctokit = await app.auth();
+    const cutoffMs = Date.now() - config.lookbackMs;
+    const deliveries = await listWebhookDeliveriesWithinLookback(appOctokit, cutoffMs);
+    const metrics = {
+      failedDeliveriesFound: 0,
+      redeliveryRequested: 0,
+      redeliverySucceeded: 0,
+      redeliveryFailed: 0,
+      maxAttemptsReached: 0,
+    };
+
+    for (const delivery of deliveries) {
+      if (!isDeliveryWithinLookback(delivery, cutoffMs) || !isFailedWebhookDelivery(delivery)) {
+        continue;
+      }
+
+      metrics.failedDeliveriesFound += 1;
+
+      const deliveryId = String(delivery?.id || "").trim();
+      if (!deliveryId) {
+        continue;
+      }
+
+      const cachedAttempt = WEBHOOK_RECOVERY_ATTEMPT_CACHE.get(deliveryId) || { attempts: 0, updatedAt: 0 };
+      const nextAttempt = cachedAttempt.attempts + 1;
+
+      if (cachedAttempt.attempts >= config.maxAttempts) {
+        metrics.maxAttemptsReached += 1;
+        continue;
+      }
+
+      metrics.redeliveryRequested += 1;
+
+      try {
+        await appOctokit.request("POST /app/hook/deliveries/{delivery_id}/attempts", {
+          delivery_id: deliveryId,
+        });
+
+        WEBHOOK_RECOVERY_ATTEMPT_CACHE.set(deliveryId, {
+          attempts: nextAttempt,
+          updatedAt: Date.now(),
+        });
+
+        metrics.redeliverySucceeded += 1;
+      } catch (error) {
+        WEBHOOK_RECOVERY_ATTEMPT_CACHE.set(deliveryId, {
+          attempts: nextAttempt,
+          updatedAt: Date.now(),
+        });
+
+        metrics.redeliveryFailed += 1;
+
+        app.log.warn(
+          {
+            error,
+            deliveryId,
+            attempt: nextAttempt,
+            event: delivery?.event,
+            guid: delivery?.guid,
+            status: delivery?.status,
+            statusCode: delivery?.status_code,
+          },
+          "Webhook redelivery request failed"
+        );
+      }
+    }
+
+    if (metrics.failedDeliveriesFound > 0 || metrics.maxAttemptsReached > 0) {
+      app.log.info(metrics, "Webhook delivery recovery sweep completed");
+    }
+  } catch (error) {
+    if (error?.status === 404 || error?.status === 403) {
+      WEBHOOK_RECOVERY_UNSUPPORTED = true;
+
+      if (WEBHOOK_RECOVERY_TIMER) {
+        clearTimeout(WEBHOOK_RECOVERY_TIMER);
+        WEBHOOK_RECOVERY_TIMER = null;
+      }
+
+      app.log.warn(
+        { error },
+        "Disabling webhook delivery recovery worker because delivery endpoints are unavailable for this app"
+      );
+    } else {
+      app.log.warn({ error }, "Webhook delivery recovery sweep failed");
+    }
+  } finally {
+    WEBHOOK_RECOVERY_RUNNING = false;
+  }
+}
+
+async function listWebhookDeliveriesWithinLookback(appOctokit, cutoffMs) {
+  const deliveries = [];
+  let page = 1;
+
+  while (true) {
+    const response = await appOctokit.request("GET /app/hook/deliveries", {
+      per_page: 100,
+      page,
+    });
+
+    const pageDeliveries = Array.isArray(response?.data) ? response.data : [];
+    if (pageDeliveries.length === 0) {
+      break;
+    }
+
+    for (const delivery of pageDeliveries) {
+      if (isDeliveryWithinLookback(delivery, cutoffMs)) {
+        deliveries.push(delivery);
+      }
+    }
+
+    const oldestDelivery = pageDeliveries[pageDeliveries.length - 1];
+    const reachedCutoff = !isDeliveryWithinLookback(oldestDelivery, cutoffMs);
+
+    if (pageDeliveries.length < 100 || reachedCutoff) {
+      break;
+    }
+
+    page += 1;
+  }
+
+  return deliveries;
+}
+
+function pruneWebhookRecoveryAttemptCache(lookbackMs) {
+  const cutoffMs = Date.now() - lookbackMs;
+
+  for (const [deliveryId, value] of WEBHOOK_RECOVERY_ATTEMPT_CACHE.entries()) {
+    if (!value || value.updatedAt < cutoffMs) {
+      WEBHOOK_RECOVERY_ATTEMPT_CACHE.delete(deliveryId);
+    }
+  }
+}
+
+function isDeliveryWithinLookback(delivery, cutoffMs) {
+  const deliveredAtMs = Date.parse(String(delivery?.delivered_at || ""));
+  return Number.isFinite(deliveredAtMs) && deliveredAtMs >= cutoffMs;
+}
+
+function isFailedWebhookDelivery(delivery) {
+  const status = String(delivery?.status || "").trim().toUpperCase();
+  if (status === "OK") {
+    return false;
+  }
+
+  const statusCode = Number(delivery?.status_code);
+  if (Number.isInteger(statusCode) && statusCode >= 200 && statusCode < 300) {
+    return false;
+  }
+
+  return true;
 }
 
 async function backfillRebaseOnlyMergePolicy(app) {
