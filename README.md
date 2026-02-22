@@ -13,7 +13,11 @@ This repository is **Docker-only** for production deployment.
   - `allow_merge_commit = false`
   - `allow_squash_merge = false`
 - Runs on startup (one-time backfill across installed repos), on install, when repositories are added to the app, and during normal bot webhook activity.
-- Ensures default branch has an active ruleset requiring status check `KumpeApps PR Compliance` and merge queue with rebase merge before merge (creates one if missing).
+- Ensures default branch has an active ruleset requiring:
+  - pull requests before merge, with only `rebase` allowed in the PR rule
+  - status check `KumpeApps PR Compliance`
+  - merge queue with rebase merge
+  (creates one if missing).
 
 ### Repository-level overrides (`.yml`)
 
@@ -31,6 +35,8 @@ compliance:
   enforce:
     rebase_only_merge: true
     default_branch_ruleset: true
+    require_pull_request: true
+    pull_request_allowed_merge_methods: [rebase] # merge | squash | rebase
     required_status_check: true
     merge_queue: true
     merge_queue_method: REBASE # REBASE | MERGE | SQUASH

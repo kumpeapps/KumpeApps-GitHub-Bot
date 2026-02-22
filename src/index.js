@@ -19,6 +19,13 @@ const DEFAULT_MERGE_QUEUE_PARAMETERS = {
   min_entries_to_merge: 1,
   min_entries_to_merge_wait_minutes: 5,
 };
+const DEFAULT_PULL_REQUEST_RULE_PARAMETERS = {
+  dismiss_stale_reviews_on_push: false,
+  require_code_owner_review: false,
+  require_last_push_approval: false,
+  required_approving_review_count: 0,
+  required_review_thread_resolution: false,
+};
 const SEVERITY_RANK = {
   low: 1,
   medium: 2,
@@ -663,6 +670,8 @@ function buildDefaultRepositoryPolicy() {
     enforcement: {
       rebaseOnlyMerge: true,
       defaultBranchRuleset: true,
+      requirePullRequest: true,
+      pullRequestAllowedMergeMethods: ["rebase"],
       requiredStatusCheck: true,
       requireMergeQueue: true,
       mergeQueueMethod: MERGE_QUEUE_REBASE_METHOD,
@@ -706,6 +715,8 @@ function normalizeRepositoryPolicyOverrides(rawConfig) {
     enforcement: {
       rebaseOnlyMerge: normalizeOptionalBoolean(source?.enforce?.rebase_only_merge),
       defaultBranchRuleset: normalizeOptionalBoolean(source?.enforce?.default_branch_ruleset),
+      requirePullRequest: normalizeOptionalBoolean(source?.enforce?.require_pull_request),
+      pullRequestAllowedMergeMethods: normalizeAllowedPullRequestMergeMethods(source?.enforce?.pull_request_allowed_merge_methods),
       requiredStatusCheck: normalizeOptionalBoolean(source?.enforce?.required_status_check),
       requireMergeQueue: normalizeOptionalBoolean(source?.enforce?.merge_queue),
       mergeQueueMethod: normalizeMergeQueueMethod(source?.enforce?.merge_queue_method),
@@ -1818,7 +1829,11 @@ function isRulesetEnforcingComplianceRequirements(ruleset, defaultBranch, policy
   const rules = Array.isArray(ruleset.rules) ? ruleset.rules : [];
   let hasComplianceCheck = false;
   let hasRequiredMergeQueue = false;
+  let hasRequiredPullRequest = false;
   const requiredMergeQueueMethod = normalizeMergeQueueMethod(policy?.enforcement?.mergeQueueMethod);
+  const requiredPrMergeMethods = normalizeAllowedPullRequestMergeMethods(
+    policy?.enforcement?.pullRequestAllowedMergeMethods || ["rebase"]
+  );
 
   for (const rule of rules) {
     const ruleType = normalizeType(rule?.type);
@@ -1834,12 +1849,20 @@ function isRulesetEnforcingComplianceRequirements(ruleset, defaultBranch, policy
           .trim()
           .toUpperCase() === requiredMergeQueueMethod;
     }
+
+    if (ruleType === "pull_request") {
+      const methods = normalizeAllowedPullRequestMergeMethods(rule?.parameters?.allowed_merge_methods);
+      hasRequiredPullRequest =
+        methods.length === requiredPrMergeMethods.length &&
+        methods.every((method) => requiredPrMergeMethods.includes(method));
+    }
   }
 
+  const pullRequestSatisfied = policy?.enforcement?.requirePullRequest ? hasRequiredPullRequest : true;
   const requiredStatusSatisfied = policy?.enforcement?.requiredStatusCheck ? hasComplianceCheck : true;
   const mergeQueueSatisfied = policy?.enforcement?.requireMergeQueue ? hasRequiredMergeQueue : true;
 
-  return requiredStatusSatisfied && mergeQueueSatisfied;
+  return pullRequestSatisfied && requiredStatusSatisfied && mergeQueueSatisfied;
 }
 
 function findRulesetForComplianceRemediation(rulesets, defaultBranch) {
@@ -1886,6 +1909,7 @@ function buildDefaultBranchConditions(existingConditions, defaultBranch) {
 function buildComplianceRules(existingRules, policy) {
   const rules = Array.isArray(existingRules) ? existingRules : [];
   const passthroughRules = [];
+  let pullRequestRule = null;
   let requiredStatusRule = null;
   let mergeQueueRule = null;
 
@@ -1893,6 +1917,10 @@ function buildComplianceRules(existingRules, policy) {
     const ruleType = normalizeType(rule?.type);
     if (ruleType === "required_status_checks") {
       requiredStatusRule = rule;
+      continue;
+    }
+    if (ruleType === "pull_request") {
+      pullRequestRule = rule;
       continue;
     }
     if (ruleType === "merge_queue") {
@@ -1912,6 +1940,16 @@ function buildComplianceRules(existingRules, policy) {
   const mergedChecks = hasComplianceCheck
     ? existingChecks
     : [...existingChecks, { context: PR_CHECK_NAME }];
+
+  if (policy?.enforcement?.requirePullRequest) {
+    passthroughRules.push({
+      type: "pull_request",
+      parameters: buildPullRequestRuleParameters(
+        pullRequestRule?.parameters,
+        policy?.enforcement?.pullRequestAllowedMergeMethods
+      ),
+    });
+  }
 
   if (policy?.enforcement?.requiredStatusCheck) {
     passthroughRules.push({
@@ -1973,6 +2011,43 @@ function buildMergeQueueParameters(existingParameters, configuredMergeMethod) {
       DEFAULT_MERGE_QUEUE_PARAMETERS.min_entries_to_merge_wait_minutes
     ),
   };
+}
+
+function buildPullRequestRuleParameters(existingParameters, configuredAllowedMergeMethods) {
+  const params = existingParameters && typeof existingParameters === "object" ? existingParameters : {};
+
+  return {
+    dismiss_stale_reviews_on_push: Boolean(
+      params.dismiss_stale_reviews_on_push ?? DEFAULT_PULL_REQUEST_RULE_PARAMETERS.dismiss_stale_reviews_on_push
+    ),
+    require_code_owner_review: Boolean(
+      params.require_code_owner_review ?? DEFAULT_PULL_REQUEST_RULE_PARAMETERS.require_code_owner_review
+    ),
+    require_last_push_approval: Boolean(
+      params.require_last_push_approval ?? DEFAULT_PULL_REQUEST_RULE_PARAMETERS.require_last_push_approval
+    ),
+    required_approving_review_count: normalizeIntegerInRange(
+      params.required_approving_review_count,
+      0,
+      10,
+      DEFAULT_PULL_REQUEST_RULE_PARAMETERS.required_approving_review_count
+    ),
+    required_review_thread_resolution: Boolean(
+      params.required_review_thread_resolution ?? DEFAULT_PULL_REQUEST_RULE_PARAMETERS.required_review_thread_resolution
+    ),
+    allowed_merge_methods: normalizeAllowedPullRequestMergeMethods(
+      configuredAllowedMergeMethods || params.allowed_merge_methods
+    ),
+  };
+}
+
+function normalizeAllowedPullRequestMergeMethods(value) {
+  const allowed = ["merge", "squash", "rebase"];
+  const normalized = Array.isArray(value)
+    ? [...new Set(value.map((item) => normalizeType(item)).filter((item) => allowed.includes(item)))]
+    : [];
+
+  return normalized.length > 0 ? normalized : ["rebase"];
 }
 
 function normalizeMergeQueueGroupingStrategy(value) {

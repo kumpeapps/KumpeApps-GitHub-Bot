@@ -4,6 +4,8 @@ compliance:
   enforce:
     rebase_only_merge: true
     default_branch_ruleset: true
+    require_pull_request: true
+    pull_request_allowed_merge_methods: [rebase]
     required_status_check: true
     merge_queue: true
     merge_queue_method: REBASE
