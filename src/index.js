@@ -20,11 +20,27 @@ const TYPE_KEYWORDS = {
 };
 
 module.exports = (app) => {
+  app.on("installation.created", async (context) => {
+    const repositories = context.payload.repositories || [];
+    for (const repository of repositories) {
+      await ensureRepositoryRebaseOnlyMerge(context, repository.owner.login, repository.name, repository);
+    }
+  });
+
+  app.on("installation_repositories.added", async (context) => {
+    const repositories = context.payload.repositories_added || [];
+    for (const repository of repositories) {
+      await ensureRepositoryRebaseOnlyMerge(context, repository.owner.login, repository.name, repository);
+    }
+  });
+
   app.on("issues.opened", async (context) => {
     const { issue, repository } = context.payload;
     const owner = repository.owner.login;
     const repo = repository.name;
     const types = getConfiguredTypes();
+
+    await ensureRepositoryRebaseOnlyMerge(context, owner, repo, repository);
 
     const existingType = await getIssueTypeName(context, owner, repo, issue);
     if (existingType) {
@@ -54,6 +70,7 @@ module.exports = (app) => {
 
   app.on("issue_comment.created", async (context) => {
     const { issue, repository, comment } = context.payload;
+    await ensureRepositoryRebaseOnlyMerge(context, repository.owner.login, repository.name, repository);
 
     if (issue.pull_request) {
       if (parseRecheckCommand(comment.body || "")) {
@@ -105,6 +122,8 @@ module.exports = (app) => {
     const owner = repository.owner.login;
     const repo = repository.name;
     const types = getConfiguredTypes();
+
+    await ensureRepositoryRebaseOnlyMerge(context, owner, repo, repository);
 
     let issueType = await getIssueTypeName(context, owner, repo, issue);
 
@@ -184,6 +203,8 @@ module.exports = (app) => {
 
   app.on("create", async (context) => {
     const { repository, ref, ref_type: refType } = context.payload;
+    await ensureRepositoryRebaseOnlyMerge(context, repository.owner.login, repository.name, repository);
+
     if (refType !== "branch") {
       return;
     }
@@ -219,12 +240,16 @@ module.exports = (app) => {
       "pull_request.synchronize",
     ],
     async (context) => {
+      const repository = context.payload.repository;
+      await ensureRepositoryRebaseOnlyMerge(context, repository.owner.login, repository.name, repository);
       await evaluatePullRequestCompliance(context);
     }
   );
 
   app.on(["pull_request.unlabeled", "pull_request.labeled"], async (context) => {
     const { pull_request: pullRequest, repository, action, label } = context.payload;
+    await ensureRepositoryRebaseOnlyMerge(context, repository.owner.login, repository.name, repository);
+
     const labelName = normalizeType(label?.name);
 
     const shouldRecheck =
@@ -244,6 +269,10 @@ module.exports = (app) => {
       await removeLabelIfPresent(context, owner, repo, pullRequest.number, PR_COMPLIANCE_RECHECK_LABEL);
     }
   });
+
+  if (isRebasePolicyBackfillEnabled()) {
+    void backfillRebaseOnlyMergePolicy(app);
+  }
 };
 
 async function evaluatePullRequestCompliance(context) {
@@ -1275,6 +1304,79 @@ async function doesBranchExist(context, owner, repo, branch) {
     }
 
     throw error;
+  }
+}
+
+async function ensureRepositoryRebaseOnlyMerge(context, owner, repo, repositoryFromPayload) {
+  let repository = repositoryFromPayload;
+
+  if (!repository) {
+    try {
+      const response = await context.octokit.repos.get({ owner, repo });
+      repository = response.data;
+    } catch (error) {
+      context.log.warn({ error, owner, repo }, "Unable to read repository settings for merge policy enforcement");
+      return;
+    }
+  }
+
+  const allowMergeCommit = repository.allow_merge_commit === true;
+  const allowSquashMerge = repository.allow_squash_merge === true;
+  const allowRebaseMerge = repository.allow_rebase_merge === true;
+
+  if (!allowMergeCommit && !allowSquashMerge && allowRebaseMerge) {
+    return;
+  }
+
+  try {
+    await context.octokit.repos.update({
+      owner,
+      repo,
+      allow_merge_commit: false,
+      allow_squash_merge: false,
+      allow_rebase_merge: true,
+    });
+
+    context.log.info({ owner, repo }, "Set repository merge policy to rebase-only");
+  } catch (error) {
+    context.log.warn({ error, owner, repo }, "Unable to set repository merge policy to rebase-only");
+  }
+}
+
+function isRebasePolicyBackfillEnabled() {
+  return normalizeType(process.env.REBASE_POLICY_BACKFILL_ON_STARTUP || "true") !== "false";
+}
+
+async function backfillRebaseOnlyMergePolicy(app) {
+  try {
+    const appOctokit = await app.auth();
+    const installations = await appOctokit.paginate(appOctokit.apps.listInstallations, {
+      per_page: 100,
+    });
+
+    for (const installation of installations) {
+      const installationOctokit = await app.auth(installation.id);
+      const repositories = await installationOctokit.paginate(
+        installationOctokit.apps.listReposAccessibleToInstallation,
+        { per_page: 100 }
+      );
+
+      for (const repository of repositories) {
+        await ensureRepositoryRebaseOnlyMerge(
+          {
+            octokit: installationOctokit,
+            log: app.log,
+          },
+          repository.owner.login,
+          repository.name,
+          repository
+        );
+      }
+    }
+
+    app.log.info("Completed startup backfill for rebase-only merge policy");
+  } catch (error) {
+    app.log.warn({ error }, "Startup backfill for rebase-only merge policy failed");
   }
 }
 

@@ -6,6 +6,14 @@ This repository is **Docker-only** for production deployment.
 
 ## What it enforces
 
+### Repository settings
+
+- Enforces rebase-only merge method on every repository the app can administer:
+  - `allow_rebase_merge = true`
+  - `allow_merge_commit = false`
+  - `allow_squash_merge = false`
+- Runs on startup (one-time backfill across installed repos), on install, when repositories are added to the app, and during normal bot webhook activity.
+
 ### Issues
 
 On `issues.opened`:
@@ -85,6 +93,7 @@ https://YOUR_PUBLIC_DOMAIN[:PORT]/api/github/webhooks
 4. Set repository permissions:
    - Issues: `Read and write`
   - Pull requests: `Read and write`
+  - Administration: `Read and write`
    - Contents: `Read and write`
    - Dependabot alerts: `Read-only`
    - Secret scanning alerts: `Read-only`
@@ -95,6 +104,8 @@ https://YOUR_PUBLIC_DOMAIN[:PORT]/api/github/webhooks
    - `issues`
    - `issue_comment`
    - `pull_request`
+  - `installation`
+  - `installation_repositories`
   - `create`
 6. Create app and download private key (`.pem`).
 7. Note your `APP_ID`.
@@ -192,6 +203,7 @@ cp .env.example .env
 - `SECURITY_GATES_ENABLED`
 - `SECURITY_GATE_MIN_SEVERITY`
 - `SECRET_SCANNING_GATES_ENABLED`
+- `REBASE_POLICY_BACKFILL_ON_STARTUP` (set `false` to disable startup sweep)
 
 4. Start:
 
@@ -211,6 +223,7 @@ From [.env.example](.env.example):
 - `SECURITY_GATES_ENABLED` (default `true`)
 - `SECURITY_GATE_MIN_SEVERITY` (default `high`)
 - `SECRET_SCANNING_GATES_ENABLED` (default `true`)
+- `REBASE_POLICY_BACKFILL_ON_STARTUP` (default `true`)
 
 ## Verify image signatures
 
