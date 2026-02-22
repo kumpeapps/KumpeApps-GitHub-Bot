@@ -40,6 +40,7 @@ const TYPE_KEYWORDS = {
 };
 
 const RULESET_ENFORCEMENT_CACHE = new Set();
+const RULESET_UNSUPPORTED_CACHE = new Set();
 const REPO_POLICY_CACHE = new Map();
 const REPO_POLICY_CACHE_TTL_MS = 60 * 1000;
 const REPO_POLICY_PATHS = [".github/kumpeapps-bot.yml", ".github/kumpeapps-bot.yaml"];
@@ -55,6 +56,11 @@ module.exports = (app) => {
       const owner = getRepositoryOwnerLogin(repository, installationOwner);
       if (!owner || !repository?.name) {
         context.log.warn({ repository }, "Skipping repository in installation.created due to missing owner/name");
+        continue;
+      }
+
+      if (isRepositoryArchived(repository)) {
+        logArchivedRepositorySkip(context.log, owner, repository.name, "installation.created");
         continue;
       }
 
@@ -75,6 +81,11 @@ module.exports = (app) => {
         continue;
       }
 
+      if (isRepositoryArchived(repository)) {
+        logArchivedRepositorySkip(context.log, owner, repository.name, "installation_repositories.added");
+        continue;
+      }
+
       await ensureRepositoryBaselineCompliance(context, owner, repository.name, repository);
     }
   });
@@ -83,6 +94,11 @@ module.exports = (app) => {
     const { issue, repository } = context.payload;
     const owner = repository.owner.login;
     const repo = repository.name;
+    if (isRepositoryArchived(repository)) {
+      logArchivedRepositorySkip(context.log, owner, repo, "issues.opened");
+      return;
+    }
+
     const policy = await getRepositoryPolicy(context, owner, repo, repository);
     const types = policy.issueTypes;
 
@@ -116,6 +132,11 @@ module.exports = (app) => {
 
   app.on("issue_comment.created", async (context) => {
     const { issue, repository, comment } = context.payload;
+    if (isRepositoryArchived(repository)) {
+      logArchivedRepositorySkip(context.log, repository.owner.login, repository.name, "issue_comment.created");
+      return;
+    }
+
     await ensureRepositoryBaselineCompliance(context, repository.owner.login, repository.name, repository);
 
     if (issue.pull_request) {
@@ -168,6 +189,11 @@ module.exports = (app) => {
     const { issue, repository } = context.payload;
     const owner = repository.owner.login;
     const repo = repository.name;
+    if (isRepositoryArchived(repository)) {
+      logArchivedRepositorySkip(context.log, owner, repo, "issues.assigned");
+      return;
+    }
+
     const policy = await getRepositoryPolicy(context, owner, repo, repository);
     const types = policy.issueTypes;
 
@@ -251,6 +277,11 @@ module.exports = (app) => {
 
   app.on("create", async (context) => {
     const { repository, ref, ref_type: refType } = context.payload;
+    if (isRepositoryArchived(repository)) {
+      logArchivedRepositorySkip(context.log, repository.owner.login, repository.name, "create");
+      return;
+    }
+
     await ensureRepositoryBaselineCompliance(context, repository.owner.login, repository.name, repository);
 
     if (refType !== "branch") {
@@ -289,6 +320,11 @@ module.exports = (app) => {
     ],
     async (context) => {
       const repository = context.payload.repository;
+      if (isRepositoryArchived(repository)) {
+        logArchivedRepositorySkip(context.log, repository.owner.login, repository.name, "pull_request");
+        return;
+      }
+
       await ensureRepositoryBaselineCompliance(context, repository.owner.login, repository.name, repository);
       await evaluatePullRequestCompliance(context);
     }
@@ -296,6 +332,11 @@ module.exports = (app) => {
 
   app.on(["pull_request.unlabeled", "pull_request.labeled"], async (context) => {
     const { pull_request: pullRequest, repository, action, label } = context.payload;
+    if (isRepositoryArchived(repository)) {
+      logArchivedRepositorySkip(context.log, repository.owner.login, repository.name, "pull_request.label_change");
+      return;
+    }
+
     await ensureRepositoryBaselineCompliance(context, repository.owner.login, repository.name, repository);
 
     const labelName = normalizeType(label?.name);
@@ -342,6 +383,11 @@ async function runPullRequestComplianceByNumber(context, owner, repo, pullNumber
 async function evaluatePullRequestComplianceCore(context, repository, pullRequest) {
   const owner = repository.owner.login;
   const repo = repository.name;
+  if (isRepositoryArchived(repository)) {
+    logArchivedRepositorySkip(context.log, owner, repo, "pull_request.compliance_evaluation");
+    return;
+  }
+
   const policy = await getRepositoryPolicy(context, owner, repo, repository);
   const allowedTypes = policy.issueTypes;
   const baseBranch = pullRequest.base.ref;
@@ -1697,6 +1743,11 @@ async function ensureRepositoryRebaseOnlyMerge(context, owner, repo, repositoryF
 }
 
 async function ensureRepositoryBaselineCompliance(context, owner, repo, repositoryFromPayload) {
+  if (isRepositoryArchived(repositoryFromPayload)) {
+    logArchivedRepositorySkip(context.log, owner, repo, "baseline_enforcement");
+    return;
+  }
+
   const policy = await getRepositoryPolicy(context, owner, repo, repositoryFromPayload);
   await ensureRepositoryRebaseOnlyMerge(context, owner, repo, repositoryFromPayload, policy);
   await ensureDefaultBranchComplianceRuleset(context, owner, repo, repositoryFromPayload, policy);
@@ -1713,6 +1764,10 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
   }
 
   const cacheKey = `${owner}/${repo}`.toLowerCase();
+  if (RULESET_UNSUPPORTED_CACHE.has(cacheKey)) {
+    return;
+  }
+
   if (RULESET_ENFORCEMENT_CACHE.has(cacheKey)) {
     return;
   }
@@ -1770,6 +1825,20 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
       "Created default-branch compliance ruleset requiring bot check and merge queue (rebase)"
     );
   } catch (error) {
+    if (isRulesetFeatureUnavailable(error)) {
+      RULESET_UNSUPPORTED_CACHE.add(cacheKey);
+      context.log.info(
+        {
+          owner,
+          repo,
+          status: error?.status,
+          message: error?.message,
+        },
+        "Skipping default-branch ruleset enforcement: repository rulesets are unavailable for this repository plan/visibility"
+      );
+      return;
+    }
+
     context.log.warn(
       {
         error,
@@ -1781,6 +1850,21 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
       "Unable to ensure default-branch compliance ruleset"
     );
   }
+}
+
+function isRulesetFeatureUnavailable(error) {
+  if (Number(error?.status) !== 403) {
+    return false;
+  }
+
+  const message = String(error?.response?.data?.message || error?.message || "").toLowerCase();
+  const docsUrl = String(error?.response?.data?.documentation_url || "").toLowerCase();
+
+  return (
+    (message.includes("upgrade to github pro") && message.includes("enable this feature")) ||
+    (message.includes("make this repository public") && message.includes("enable this feature")) ||
+    docsUrl.includes("/rest/repos/rules")
+  );
 }
 
 async function upsertExistingComplianceRuleset(context, { owner, repo, defaultBranch, ruleset, policy }) {
@@ -2102,6 +2186,11 @@ async function backfillRebaseOnlyMergePolicy(app) {
           continue;
         }
 
+        if (isRepositoryArchived(repository)) {
+          logArchivedRepositorySkip(app.log, owner, repository.name, "startup_backfill");
+          continue;
+        }
+
         const policy = await getRepositoryPolicy(
           {
             octokit: installationOctokit,
@@ -2136,9 +2225,41 @@ async function backfillRebaseOnlyMergePolicy(app) {
     }
 
     app.log.info("Completed startup backfill for rebase-only merge policy");
+    logRulesetUnsupportedSummary(app.log);
   } catch (error) {
     app.log.warn({ error }, "Startup backfill for rebase-only merge policy failed");
+    logRulesetUnsupportedSummary(app.log);
   }
+}
+
+function logRulesetUnsupportedSummary(logger) {
+  if (!RULESET_UNSUPPORTED_CACHE.size) {
+    return;
+  }
+
+  const repositories = [...RULESET_UNSUPPORTED_CACHE].sort();
+  logger.info(
+    {
+      count: repositories.length,
+      repositories,
+    },
+    "Ruleset enforcement skipped for repositories where the rulesets feature is unavailable"
+  );
+}
+
+function isRepositoryArchived(repository) {
+  return Boolean(repository?.archived);
+}
+
+function logArchivedRepositorySkip(logger, owner, repo, eventName) {
+  logger.info(
+    {
+      owner,
+      repo,
+      event: eventName,
+    },
+    "Skipping automation for archived repository"
+  );
 }
 
 function getRepositoryOwnerLogin(repository, fallbackOwner = "") {

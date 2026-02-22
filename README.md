@@ -81,6 +81,8 @@ Notes:
 - Overrides are cached briefly in-memory (~60s) before re-read.
 - Invalid values fall back to defaults.
 - This repo includes [.github/kumpeapps-bot.yml](.github/kumpeapps-bot.yml) with default-equivalent values, so it does not change behavior here.
+- If GitHub rulesets are unavailable for a repository plan/visibility (for example private repo without GitHub Pro), bot skips ruleset enforcement for that repo and continues other compliance features.
+- Archived repositories are automatically skipped for all automation and enforcement.
 
 ### Issues
 
