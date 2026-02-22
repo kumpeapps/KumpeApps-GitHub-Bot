@@ -24,16 +24,36 @@ const RULESET_ENFORCEMENT_CACHE = new Set();
 
 module.exports = (app) => {
   app.on("installation.created", async (context) => {
+    warnIfAdministrationPermissionMissing(context);
+
     const repositories = context.payload.repositories || [];
+    const installationOwner = context.payload.installation?.account?.login;
+
     for (const repository of repositories) {
-      await ensureRepositoryBaselineCompliance(context, repository.owner.login, repository.name, repository);
+      const owner = getRepositoryOwnerLogin(repository, installationOwner);
+      if (!owner || !repository?.name) {
+        context.log.warn({ repository }, "Skipping repository in installation.created due to missing owner/name");
+        continue;
+      }
+
+      await ensureRepositoryBaselineCompliance(context, owner, repository.name, repository);
     }
   });
 
   app.on("installation_repositories.added", async (context) => {
+    warnIfAdministrationPermissionMissing(context);
+
     const repositories = context.payload.repositories_added || [];
+    const installationOwner = context.payload.installation?.account?.login;
+
     for (const repository of repositories) {
-      await ensureRepositoryBaselineCompliance(context, repository.owner.login, repository.name, repository);
+      const owner = getRepositoryOwnerLogin(repository, installationOwner);
+      if (!owner || !repository?.name) {
+        context.log.warn({ repository }, "Skipping repository in installation_repositories.added due to missing owner/name");
+        continue;
+      }
+
+      await ensureRepositoryBaselineCompliance(context, owner, repository.name, repository);
     }
   });
 
@@ -1311,6 +1331,11 @@ async function doesBranchExist(context, owner, repo, branch) {
 }
 
 async function ensureRepositoryRebaseOnlyMerge(context, owner, repo, repositoryFromPayload) {
+  if (!owner || !repo) {
+    context.log.warn({ owner, repo }, "Skipping rebase-only enforcement due to missing owner/repo");
+    return;
+  }
+
   let repository = repositoryFromPayload;
 
   if (!repository) {
@@ -1342,7 +1367,17 @@ async function ensureRepositoryRebaseOnlyMerge(context, owner, repo, repositoryF
 
     context.log.info({ owner, repo }, "Set repository merge policy to rebase-only");
   } catch (error) {
-    context.log.warn({ error, owner, repo }, "Unable to set repository merge policy to rebase-only");
+    context.log.warn(
+      {
+        error,
+        owner,
+        repo,
+        status: error?.status,
+        message: error?.message,
+        acceptedPermissions: error?.response?.headers?.["x-accepted-github-permissions"],
+      },
+      "Unable to set repository merge policy to rebase-only (requires Administration: Read and write + app reinstall/approval)"
+    );
   }
 }
 
@@ -1352,6 +1387,11 @@ async function ensureRepositoryBaselineCompliance(context, owner, repo, reposito
 }
 
 async function ensureDefaultBranchComplianceRuleset(context, owner, repo, repositoryFromPayload) {
+  if (!owner || !repo) {
+    context.log.warn({ owner, repo }, "Skipping ruleset enforcement due to missing owner/repo");
+    return;
+  }
+
   const cacheKey = `${owner}/${repo}`.toLowerCase();
   if (RULESET_ENFORCEMENT_CACHE.has(cacheKey)) {
     return;
@@ -1371,7 +1411,7 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
   const defaultBranch = repository.default_branch;
 
   try {
-    const rulesets = await context.octokit.paginate(context.octokit.request, "GET /repos/{owner}/{repo}/rulesets", {
+    const rulesets = await context.octokit.paginate("GET /repos/{owner}/{repo}/rulesets", {
       owner,
       repo,
       includes_parents: false,
@@ -1416,7 +1456,16 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
     RULESET_ENFORCEMENT_CACHE.add(cacheKey);
     context.log.info({ owner, repo, defaultBranch }, "Created default-branch compliance ruleset requiring bot check");
   } catch (error) {
-    context.log.warn({ error, owner, repo }, "Unable to ensure default-branch compliance ruleset");
+    context.log.warn(
+      {
+        error,
+        owner,
+        repo,
+        status: error?.status,
+        message: error?.message,
+      },
+      "Unable to ensure default-branch compliance ruleset"
+    );
   }
 }
 
@@ -1460,18 +1509,25 @@ async function backfillRebaseOnlyMergePolicy(app) {
 
     for (const installation of installations) {
       const installationOctokit = await app.auth(installation.id);
+      const installationOwner = installation?.account?.login;
       const repositories = await installationOctokit.paginate(
         installationOctokit.apps.listReposAccessibleToInstallation,
         { per_page: 100 }
       );
 
       for (const repository of repositories) {
+        const owner = getRepositoryOwnerLogin(repository, installationOwner);
+        if (!owner || !repository?.name) {
+          app.log.warn({ repository }, "Skipping repository in startup backfill due to missing owner/name");
+          continue;
+        }
+
         await ensureRepositoryRebaseOnlyMerge(
           {
             octokit: installationOctokit,
             log: app.log,
           },
-          repository.owner.login,
+          owner,
           repository.name,
           repository
         );
@@ -1480,7 +1536,7 @@ async function backfillRebaseOnlyMergePolicy(app) {
             octokit: installationOctokit,
             log: app.log,
           },
-          repository.owner.login,
+          owner,
           repository.name,
           repository
         );
@@ -1491,6 +1547,36 @@ async function backfillRebaseOnlyMergePolicy(app) {
   } catch (error) {
     app.log.warn({ error }, "Startup backfill for rebase-only merge policy failed");
   }
+}
+
+function getRepositoryOwnerLogin(repository, fallbackOwner = "") {
+  const directOwner = repository?.owner?.login;
+  if (directOwner) {
+    return directOwner;
+  }
+
+  const fullName = String(repository?.full_name || "");
+  const slashIndex = fullName.indexOf("/");
+  if (slashIndex > 0) {
+    return fullName.slice(0, slashIndex);
+  }
+
+  return String(fallbackOwner || "");
+}
+
+function warnIfAdministrationPermissionMissing(context) {
+  const adminPermission = context.payload?.installation?.permissions?.administration;
+  if (adminPermission === "write") {
+    return;
+  }
+
+  context.log.warn(
+    {
+      installationId: context.payload?.installation?.id,
+      administrationPermission: adminPermission || "none",
+    },
+    "GitHub App installation is missing Administration: Read and write; rebase-only and ruleset enforcement will not work"
+  );
 }
 
 async function getBranchHeadSha(context, owner, repo, branchName) {
