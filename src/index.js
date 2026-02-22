@@ -7,6 +7,7 @@ const PR_COMPLIANCE_FAIL_LABEL = "compliance:fail";
 const PR_COMPLIANCE_RECHECK_LABEL = "compliance:recheck";
 const PR_AUTOCLOSE_MARKER = "<!-- kumpeapps-issue-autoclose -->";
 const DEFAULT_BRANCH_RULESET_NAME = "KumpeApps Default Branch Compliance";
+const MERGE_QUEUE_REBASE_METHOD = "REBASE";
 const SEVERITY_RANK = {
   low: 1,
   medium: 2,
@@ -1418,9 +1419,31 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
       per_page: 100,
     });
 
-    const alreadyCovered = rulesets.some((ruleset) => isRulesetEnforcingComplianceCheck(ruleset, defaultBranch));
+    const alreadyCovered = rulesets.some((ruleset) => isRulesetEnforcingComplianceRequirements(ruleset, defaultBranch));
     if (alreadyCovered) {
       RULESET_ENFORCEMENT_CACHE.add(cacheKey);
+      return;
+    }
+
+    const rulesetToRemediate = findRulesetForComplianceRemediation(rulesets, defaultBranch);
+    if (rulesetToRemediate?.id) {
+      await context.octokit.request("PUT /repos/{owner}/{repo}/rulesets/{ruleset_id}", {
+        owner,
+        repo,
+        ruleset_id: rulesetToRemediate.id,
+        name: rulesetToRemediate.name || DEFAULT_BRANCH_RULESET_NAME,
+        target: "branch",
+        enforcement: "active",
+        conditions: buildDefaultBranchConditions(rulesetToRemediate.conditions, defaultBranch),
+        rules: buildComplianceRules(rulesetToRemediate.rules),
+        bypass_actors: Array.isArray(rulesetToRemediate.bypass_actors) ? rulesetToRemediate.bypass_actors : [],
+      });
+
+      RULESET_ENFORCEMENT_CACHE.add(cacheKey);
+      context.log.info(
+        { owner, repo, defaultBranch, rulesetId: rulesetToRemediate.id },
+        "Updated existing default-branch ruleset to require bot check and merge queue (rebase)"
+      );
       return;
     }
 
@@ -1449,12 +1472,21 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
             ],
           },
         },
+        {
+          type: "merge_queue",
+          parameters: {
+            merge_method: MERGE_QUEUE_REBASE_METHOD,
+          },
+        },
       ],
       bypass_actors: [],
     });
 
     RULESET_ENFORCEMENT_CACHE.add(cacheKey);
-    context.log.info({ owner, repo, defaultBranch }, "Created default-branch compliance ruleset requiring bot check");
+    context.log.info(
+      { owner, repo, defaultBranch },
+      "Created default-branch compliance ruleset requiring bot check and merge queue (rebase)"
+    );
   } catch (error) {
     context.log.warn(
       {
@@ -1469,7 +1501,7 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
   }
 }
 
-function isRulesetEnforcingComplianceCheck(ruleset, defaultBranch) {
+function isRulesetEnforcingComplianceRequirements(ruleset, defaultBranch) {
   if (!ruleset || normalizeType(ruleset.target) !== "branch" || normalizeType(ruleset.enforcement) !== "active") {
     return false;
   }
@@ -1481,19 +1513,116 @@ function isRulesetEnforcingComplianceCheck(ruleset, defaultBranch) {
   }
 
   const rules = Array.isArray(ruleset.rules) ? ruleset.rules : [];
+  let hasComplianceCheck = false;
+  let hasRebaseMergeQueue = false;
+
   for (const rule of rules) {
-    if (normalizeType(rule?.type) !== "required_status_checks") {
-      continue;
+    const ruleType = normalizeType(rule?.type);
+
+    if (ruleType === "required_status_checks") {
+      const checks = rule?.parameters?.required_status_checks || [];
+      hasComplianceCheck = checks.some((check) => normalizeType(check?.context) === normalizeType(PR_CHECK_NAME));
     }
 
-    const checks = rule?.parameters?.required_status_checks || [];
-    const hasComplianceCheck = checks.some((check) => normalizeType(check?.context) === normalizeType(PR_CHECK_NAME));
-    if (hasComplianceCheck) {
-      return true;
+    if (ruleType === "merge_queue") {
+      hasRebaseMergeQueue =
+        normalizeType(rule?.parameters?.merge_method) === normalizeType(MERGE_QUEUE_REBASE_METHOD);
     }
   }
 
-  return false;
+  return hasComplianceCheck && hasRebaseMergeQueue;
+}
+
+function findRulesetForComplianceRemediation(rulesets, defaultBranch) {
+  if (!Array.isArray(rulesets) || rulesets.length === 0) {
+    return null;
+  }
+
+  const namedMatch = rulesets.find(
+    (ruleset) =>
+      normalizeType(ruleset?.target) === "branch" &&
+      normalizeType(ruleset?.name) === normalizeType(DEFAULT_BRANCH_RULESET_NAME)
+  );
+  if (namedMatch) {
+    return namedMatch;
+  }
+
+  return (
+    rulesets.find(
+      (ruleset) =>
+        normalizeType(ruleset?.target) === "branch" &&
+        isRulesetTargetingDefaultBranch(ruleset, defaultBranch)
+    ) || null
+  );
+}
+
+function isRulesetTargetingDefaultBranch(ruleset, defaultBranch) {
+  const include = Array.isArray(ruleset?.conditions?.ref_name?.include) ? ruleset.conditions.ref_name.include : [];
+  return include.includes("~DEFAULT_BRANCH") || include.includes(`refs/heads/${defaultBranch}`);
+}
+
+function buildDefaultBranchConditions(existingConditions, defaultBranch) {
+  if (isRulesetTargetingDefaultBranch({ conditions: existingConditions }, defaultBranch)) {
+    return existingConditions;
+  }
+
+  return {
+    ref_name: {
+      include: ["~DEFAULT_BRANCH"],
+      exclude: [],
+    },
+  };
+}
+
+function buildComplianceRules(existingRules) {
+  const rules = Array.isArray(existingRules) ? existingRules : [];
+  const passthroughRules = [];
+  let requiredStatusRule = null;
+  let mergeQueueRule = null;
+
+  for (const rule of rules) {
+    const ruleType = normalizeType(rule?.type);
+    if (ruleType === "required_status_checks") {
+      requiredStatusRule = rule;
+      continue;
+    }
+    if (ruleType === "merge_queue") {
+      mergeQueueRule = rule;
+      continue;
+    }
+    passthroughRules.push(rule);
+  }
+
+  const existingChecks = Array.isArray(requiredStatusRule?.parameters?.required_status_checks)
+    ? requiredStatusRule.parameters.required_status_checks
+    : [];
+  const hasComplianceCheck = existingChecks.some(
+    (check) => normalizeType(check?.context) === normalizeType(PR_CHECK_NAME)
+  );
+
+  const mergedChecks = hasComplianceCheck
+    ? existingChecks
+    : [...existingChecks, { context: PR_CHECK_NAME }];
+
+  const requiredStatusRuleOutput = {
+    type: "required_status_checks",
+    parameters: {
+      ...requiredStatusRule?.parameters,
+      strict_required_status_checks_policy: true,
+      do_not_enforce_on_create: false,
+      required_status_checks: mergedChecks,
+    },
+  };
+
+  const mergeQueueRuleOutput = {
+    type: "merge_queue",
+    parameters: {
+      ...mergeQueueRule?.parameters,
+      merge_method: MERGE_QUEUE_REBASE_METHOD,
+    },
+  };
+
+  return [...passthroughRules, requiredStatusRuleOutput, mergeQueueRuleOutput];
 }
 
 function isRebasePolicyBackfillEnabled() {
