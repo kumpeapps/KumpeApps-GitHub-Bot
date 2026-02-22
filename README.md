@@ -59,6 +59,7 @@ compliance:
   security:
     dependabot_gate_enabled: true
     secret_scanning_gate_enabled: true
+    local_secret_scanning_enabled: true
     min_severity: high # low | medium | high | critical
 ```
 
@@ -124,7 +125,10 @@ Security gates:
   - blocking on `main/master`
 - Secret-scanning alerts:
   - always blocking on `dev/main/master`
-- Security gates are automatically skipped for private repositories.
+- Local secret scanner (changed PR files):
+  - regex + entropy-based detection for likely leaked tokens/keys
+  - blocking on `dev/main/master`
+- For private repositories, Dependabot/secret-scanning API gates are skipped, but local secret scanner still runs by default.
 
 Dependabot exception:
 - Dependabot PRs auto-pass and get greeting comment.
@@ -280,6 +284,7 @@ cp .env.example .env
 - `SECURITY_GATES_ENABLED`
 - `SECURITY_GATE_MIN_SEVERITY`
 - `SECRET_SCANNING_GATES_ENABLED`
+- `LOCAL_SECRET_SCANNING_ENABLED`
 - `REBASE_POLICY_BACKFILL_ON_STARTUP` (set `false` to disable startup sweep)
 
 4. Start:
@@ -300,6 +305,7 @@ From [.env.example](.env.example):
 - `SECURITY_GATES_ENABLED` (default `true`)
 - `SECURITY_GATE_MIN_SEVERITY` (default `high`)
 - `SECRET_SCANNING_GATES_ENABLED` (default `true`)
+- `LOCAL_SECRET_SCANNING_ENABLED` (default `true`)
 - `REBASE_POLICY_BACKFILL_ON_STARTUP` (default `true`)
 
 ## Verify image signatures

@@ -47,6 +47,45 @@ const MERGE_GROUP_SNAPSHOT_MAX_PENDING_ERRORS = 3;
 const REPO_POLICY_CACHE = new Map();
 const REPO_POLICY_CACHE_TTL_MS = 60 * 1000;
 const REPO_POLICY_PATHS = [".github/kumpeapps-bot.yml", ".github/kumpeapps-bot.yaml"];
+const LOCAL_SECRET_SCANNER_RULE_NAME = "Local secret scanner";
+const LOCAL_SECRET_SCANNER_ALLOW_MARKER = "kumpeapps:allow-secret";
+const LOCAL_SECRET_SCAN_MAX_FILE_BYTES = 250_000;
+const LOCAL_SECRET_SCAN_MAX_FINDINGS = 50;
+const LOCAL_SECRET_SCAN_FETCH_CONCURRENCY = 4;
+const LOCAL_SECRET_SCAN_PATH_IGNORES = [
+  /(^|\/)(node_modules|dist|build|coverage|vendor|\.git|\.next|target|tmp|temp)\//,
+  /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.ya?ml|poetry\.lock|cargo\.lock)$/,
+  /\.(png|jpg|jpeg|gif|svg|ico|pdf|zip|gz|tgz|bz2|7z|mp3|mp4|mov|avi|woff2?|ttf|eot|class|jar|min\.js|min\.css)$/,
+];
+const LOCAL_SECRET_GENERIC_ASSIGNMENT_REGEX =
+  /\b(api[_-]?key|secret|token|password|passwd|client[_-]?secret|private[_-]?key)\b\s*[:=]\s*["']?([A-Za-z0-9_\-\/=+]{10,})["']?/gi;
+const LOCAL_SECRET_HIGH_ENTROPY_REGEX = /[A-Za-z0-9+/=]{24,}/g;
+const LOCAL_SECRET_DETECTORS = [
+  {
+    name: "GitHub token",
+    pattern: /\bgh[pousr]_[A-Za-z0-9]{20,255}\b/g,
+  },
+  {
+    name: "GitHub fine-grained token",
+    pattern: /\bgithub_pat_[A-Za-z0-9_]{40,255}\b/g,
+  },
+  {
+    name: "AWS access key",
+    pattern: /\b(A3T|AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA)[0-9A-Z]{16}\b/g,
+  },
+  {
+    name: "Slack token",
+    pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,100}\b/g,
+  },
+  {
+    name: "Stripe live key",
+    pattern: /\bsk_live_[A-Za-z0-9]{16,}\b/g,
+  },
+  {
+    name: "Private key block",
+    pattern: /-----BEGIN (RSA|EC|OPENSSH|DSA|PGP|PRIVATE) PRIVATE KEY-----/g,
+  },
+];
 
 module.exports = (app) => {
   app.on("installation.created", async (context) => {
@@ -787,6 +826,7 @@ function buildDefaultRepositoryPolicy() {
     security: {
       dependabotGateEnabled: normalizeType(process.env.SECURITY_GATES_ENABLED || "true") !== "false",
       secretScanningGateEnabled: normalizeType(process.env.SECRET_SCANNING_GATES_ENABLED || "true") !== "false",
+      localSecretScannerEnabled: normalizeType(process.env.LOCAL_SECRET_SCANNING_ENABLED || "true") !== "false",
       minSeverity: normalizeSecuritySeverity(process.env.SECURITY_GATE_MIN_SEVERITY || "high"),
     },
   };
@@ -833,6 +873,7 @@ function normalizeRepositoryPolicyOverrides(rawConfig) {
     security: {
       dependabotGateEnabled: normalizeOptionalBoolean(source?.security?.dependabot_gate_enabled),
       secretScanningGateEnabled: normalizeOptionalBoolean(source?.security?.secret_scanning_gate_enabled),
+      localSecretScannerEnabled: normalizeOptionalBoolean(source?.security?.local_secret_scanning_enabled),
       minSeverity: normalizeSecuritySeverity(source?.security?.min_severity),
     },
   };
@@ -1725,12 +1766,15 @@ async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepos
   if (isPrivateRepository) {
     ruleResults.push({ name: "Dependabot alert gate", passed: true, detail: "Skipped for private repositories." });
     ruleResults.push({ name: "Secret-scanning alert gate", passed: true, detail: "Skipped for private repositories." });
+    warnings.push("Private repository: Dependabot and secret-scanning API gates are skipped; local secret scanner remains enforced.");
+    await runLocalSecretScannerIfEnabled(context, owner, repo, policy, pullRequest, failures, ruleResults);
     return { failures, warnings, ruleResults };
   }
 
   if (!isSecurityGateEnabled(policy)) {
     ruleResults.push({ name: "Dependabot alert gate", passed: true, detail: "Disabled by SECURITY_GATES_ENABLED=false." });
     ruleResults.push({ name: "Secret-scanning alert gate", passed: true, detail: "Disabled by SECURITY_GATES_ENABLED=false." });
+    await runLocalSecretScannerIfEnabled(context, owner, repo, policy, pullRequest, failures, ruleResults);
     return { failures, warnings, ruleResults };
   }
 
@@ -1831,7 +1875,19 @@ async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepos
     ruleResults.push({ name: "Secret-scanning alert gate", passed: true, detail: "Disabled by SECRET_SCANNING_GATES_ENABLED=false." });
   }
 
+  await runLocalSecretScannerIfEnabled(context, owner, repo, policy, pullRequest, failures, ruleResults);
+
   return { failures, warnings, ruleResults };
+}
+
+async function runLocalSecretScannerIfEnabled(context, owner, repo, policy, pullRequest, failures, ruleResults) {
+  if (!isLocalSecretScannerEnabled(policy)) {
+    ruleResults.push({ name: LOCAL_SECRET_SCANNER_RULE_NAME, passed: true, detail: "Disabled by LOCAL_SECRET_SCANNING_ENABLED=false." });
+    return;
+  }
+
+  const localScanResult = await runLocalSecretScannerGate(context, owner, repo, pullRequest);
+  applyLocalSecretScannerGateResult(localScanResult, failures, ruleResults);
 }
 
 async function detectPullRequestSecurityRemediationSignals(context, owner, repo, pullRequest) {
@@ -1920,6 +1976,338 @@ function isPotentialSecretRemediationFile(filename) {
   ].some((pattern) => pattern.test(file));
 }
 
+async function runLocalSecretScannerGate(context, owner, repo, pullRequest) {
+  const pullNumber = Number(pullRequest?.number || 0);
+  const headSha = String(pullRequest?.head?.sha || "");
+
+  if (!pullNumber || !headSha) {
+    return {
+      available: false,
+      reason: "pull request metadata missing",
+      findings: [],
+      scannedFiles: 0,
+    };
+  }
+
+  try {
+    const files = await context.octokit.paginate(context.octokit.pulls.listFiles, {
+      owner,
+      repo,
+      pull_number: pullNumber,
+      per_page: 100,
+    });
+
+    const findings = [];
+    let scannedFiles = 0;
+    const filesNeedingContentFetch = [];
+
+    for (const file of files) {
+      const filename = String(file?.filename || "");
+      const status = normalizeType(file?.status);
+
+      if (!filename || status === "removed" || shouldSkipLocalSecretScanPath(filename)) {
+        continue;
+      }
+
+      const patch = String(file?.patch || "");
+      if (patch) {
+        scannedFiles += 1;
+        findings.push(...scanPatchForSecrets(patch, filename));
+        if (findings.length >= LOCAL_SECRET_SCAN_MAX_FINDINGS) {
+          break;
+        }
+        continue;
+      }
+
+      filesNeedingContentFetch.push(filename);
+    }
+
+    for (
+      let offset = 0;
+      offset < filesNeedingContentFetch.length && findings.length < LOCAL_SECRET_SCAN_MAX_FINDINGS;
+      offset += LOCAL_SECRET_SCAN_FETCH_CONCURRENCY
+    ) {
+      const batch = filesNeedingContentFetch.slice(offset, offset + LOCAL_SECRET_SCAN_FETCH_CONCURRENCY);
+      const batchResults = await Promise.all(
+        batch.map((filename) => fetchScannableFileContentForLocalScan(context, owner, repo, filename, headSha))
+      );
+
+      for (const result of batchResults) {
+        if (!result) {
+          continue;
+        }
+
+        scannedFiles += 1;
+        findings.push(...scanTextForSecrets(result.content, result.filename));
+        if (findings.length >= LOCAL_SECRET_SCAN_MAX_FINDINGS) {
+          break;
+        }
+      }
+    }
+
+    return {
+      available: true,
+      findings: findings.slice(0, LOCAL_SECRET_SCAN_MAX_FINDINGS),
+      scannedFiles,
+    };
+  } catch (error) {
+    context.log.warn({ error, owner, repo, pullNumber }, "Unable to run local secret scanner on PR files");
+    return {
+      available: false,
+      reason: "unable to list pull request files",
+      findings: [],
+      scannedFiles: 0,
+    };
+  }
+}
+
+async function fetchScannableFileContentForLocalScan(context, owner, repo, filename, headSha) {
+  try {
+    const response = await context.octokit.repos.getContent({
+      owner,
+      repo,
+      path: filename,
+      ref: headSha,
+    });
+
+    const data = response?.data;
+    if (!data || Array.isArray(data) || data.type !== "file") {
+      return null;
+    }
+
+    const fileSize = Number(data.size || 0);
+    if (fileSize > LOCAL_SECRET_SCAN_MAX_FILE_BYTES) {
+      return null;
+    }
+
+    const encoding = normalizeType(data.encoding);
+    const rawContent = String(data.content || "");
+    const content =
+      encoding === "base64"
+        ? Buffer.from(rawContent, "base64").toString("utf8")
+        : rawContent;
+
+    if (!isLikelyTextContent(content)) {
+      return null;
+    }
+
+    return {
+      filename,
+      content,
+    };
+  } catch (error) {
+    context.log.warn({ error, owner, repo, filename }, "Local secret scanner skipped file due to read error");
+    return null;
+  }
+}
+
+function applyLocalSecretScannerGateResult(localScanResult, failures, ruleResults) {
+  if (!localScanResult?.available) {
+    const reason = localScanResult?.reason || "scanner execution failed";
+    failures.push(`Security gate could not complete local secret scan (${reason}).`);
+    ruleResults.push({ name: LOCAL_SECRET_SCANNER_RULE_NAME, passed: false, detail: `${reason}.` });
+    return;
+  }
+
+  const findings = Array.isArray(localScanResult.findings) ? localScanResult.findings : [];
+  if (findings.length === 0) {
+    ruleResults.push({
+      name: LOCAL_SECRET_SCANNER_RULE_NAME,
+      passed: true,
+      detail: `No potential secrets found in ${localScanResult.scannedFiles} changed file(s).`,
+    });
+    return;
+  }
+
+  const preview = findings
+    .slice(0, 3)
+    .map((finding) => `${finding.file}:${finding.line} (${finding.detector})`)
+    .join(", ");
+  failures.push(`Local secret scanner found ${findings.length} potential secret(s). Example(s): ${preview}.`);
+  ruleResults.push({
+    name: LOCAL_SECRET_SCANNER_RULE_NAME,
+    passed: false,
+    detail: `${findings.length} potential secret(s) found across ${localScanResult.scannedFiles} changed file(s).`,
+  });
+}
+
+function shouldSkipLocalSecretScanPath(filename) {
+  const normalizedPath = normalizeType(filename);
+  if (!normalizedPath) {
+    return true;
+  }
+
+  return LOCAL_SECRET_SCAN_PATH_IGNORES.some((pattern) => pattern.test(normalizedPath));
+}
+
+function scanTextForSecrets(content, file) {
+  if (!content) {
+    return [];
+  }
+
+  const findings = [];
+  const lines = content.split(/\r?\n/);
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = String(lines[index] || "");
+    if (!line || line.includes(LOCAL_SECRET_SCANNER_ALLOW_MARKER)) {
+      continue;
+    }
+
+    const lineNumber = index + 1;
+
+    for (const detector of LOCAL_SECRET_DETECTORS) {
+      const matches = line.match(detector.pattern) || [];
+      for (const match of matches) {
+        if (shouldIgnoreSecretCandidate(match, line)) {
+          continue;
+        }
+        findings.push({ file, line: lineNumber, detector: detector.name });
+        if (findings.length >= LOCAL_SECRET_SCAN_MAX_FINDINGS) {
+          return findings;
+        }
+      }
+    }
+
+    const genericAssignmentMatches = line.matchAll(
+      new RegExp(LOCAL_SECRET_GENERIC_ASSIGNMENT_REGEX.source, LOCAL_SECRET_GENERIC_ASSIGNMENT_REGEX.flags)
+    );
+    for (const match of genericAssignmentMatches) {
+      const secretValue = String(match[2] || "");
+      if (!secretValue || shouldIgnoreSecretCandidate(secretValue, line)) {
+        continue;
+      }
+      findings.push({ file, line: lineNumber, detector: "Generic secret assignment" });
+      if (findings.length >= LOCAL_SECRET_SCAN_MAX_FINDINGS) {
+        return findings;
+      }
+    }
+
+    const entropyCandidates = line.match(LOCAL_SECRET_HIGH_ENTROPY_REGEX) || [];
+    for (const candidate of entropyCandidates) {
+      if (shouldIgnoreSecretCandidate(candidate, line)) {
+        continue;
+      }
+
+      if (calculateShannonEntropy(candidate) >= 4.0) {
+        findings.push({ file, line: lineNumber, detector: "High entropy token" });
+        if (findings.length >= LOCAL_SECRET_SCAN_MAX_FINDINGS) {
+          return findings;
+        }
+      }
+    }
+  }
+
+  return findings;
+}
+
+function scanPatchForSecrets(patch, file) {
+  if (!patch) {
+    return [];
+  }
+
+  const addedLines = extractAddedLinesFromPatch(patch);
+  if (addedLines.length === 0) {
+    return [];
+  }
+
+  return scanTextForSecrets(addedLines.map((line) => line.text).join("\n"), file).map((finding) => {
+    const addedLine = addedLines[finding.line - 1];
+    if (!addedLine) {
+      return finding;
+    }
+
+    return {
+      ...finding,
+      line: addedLine.line,
+    };
+  });
+}
+
+function extractAddedLinesFromPatch(patch) {
+  const lines = String(patch || "").split(/\r?\n/);
+  const addedLines = [];
+  let nextTargetLine = 0;
+
+  for (const rawLine of lines) {
+    const line = String(rawLine || "");
+    const hunkMatch = line.match(/^@@\s+-\d+(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@/);
+    if (hunkMatch) {
+      nextTargetLine = Number(hunkMatch[1] || 0);
+      continue;
+    }
+
+    if (line.startsWith("+++ ") || line.startsWith("--- ") || line.startsWith("\\ No newline")) {
+      continue;
+    }
+
+    if (line.startsWith("+")) {
+      addedLines.push({
+        line: nextTargetLine > 0 ? nextTargetLine : 1,
+        text: line.slice(1),
+      });
+      nextTargetLine += 1;
+      continue;
+    }
+
+    if (line.startsWith(" ")) {
+      nextTargetLine += 1;
+      continue;
+    }
+  }
+
+  return addedLines;
+}
+
+function shouldIgnoreSecretCandidate(candidate, line) {
+  const token = normalizeType(candidate);
+  const normalizedLine = normalizeType(line);
+  if (!token || !normalizedLine) {
+    return true;
+  }
+
+  if (token.length < 10) {
+    return true;
+  }
+
+  if (
+    /(example|sample|dummy|test|fake|changeme|your[_-]?|placeholder|xxxxx|abc123|lorem|notasecret|null|undefined)/.test(
+      normalizedLine
+    )
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function calculateShannonEntropy(value) {
+  if (!value) {
+    return 0;
+  }
+
+  const counts = new Map();
+  for (const char of value) {
+    counts.set(char, (counts.get(char) || 0) + 1);
+  }
+
+  let entropy = 0;
+  for (const count of counts.values()) {
+    const probability = count / value.length;
+    entropy -= probability * Math.log2(probability);
+  }
+
+  return entropy;
+}
+
+function isLikelyTextContent(content) {
+  if (typeof content !== "string") {
+    return false;
+  }
+
+  return !content.includes("\u0000");
+}
+
 async function getOpenDependabotAlerts(context, owner, repo) {
   try {
     const alerts = await context.octokit.paginate("GET /repos/{owner}/{repo}/dependabot/alerts", {
@@ -1951,6 +2339,14 @@ function isSecretScanningGateEnabled(policy) {
   }
 
   return normalizeType(process.env.SECRET_SCANNING_GATES_ENABLED || "true") !== "false";
+}
+
+function isLocalSecretScannerEnabled(policy) {
+  if (typeof policy?.security?.localSecretScannerEnabled === "boolean") {
+    return policy.security.localSecretScannerEnabled;
+  }
+
+  return normalizeType(process.env.LOCAL_SECRET_SCANNING_ENABLED || "true") !== "false";
 }
 
 async function getOpenSecretScanningAlerts(context, owner, repo) {

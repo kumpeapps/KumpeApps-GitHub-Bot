@@ -25,4 +25,5 @@ compliance:
   security:
     dependabot_gate_enabled: true
     secret_scanning_gate_enabled: true
+    local_secret_scanning_enabled: true
     min_severity: high
