@@ -6,6 +6,7 @@ const PR_COMPLIANCE_PASS_LABEL = "compliance:pass";
 const PR_COMPLIANCE_FAIL_LABEL = "compliance:fail";
 const PR_COMPLIANCE_RECHECK_LABEL = "compliance:recheck";
 const PR_AUTOCLOSE_MARKER = "<!-- kumpeapps-issue-autoclose -->";
+const DEFAULT_BRANCH_RULESET_NAME = "KumpeApps Default Branch Compliance";
 const SEVERITY_RANK = {
   low: 1,
   medium: 2,
@@ -19,18 +20,20 @@ const TYPE_KEYWORDS = {
   task: ["task", "todo", "work", "implement", "update", "refactor"],
 };
 
+const RULESET_ENFORCEMENT_CACHE = new Set();
+
 module.exports = (app) => {
   app.on("installation.created", async (context) => {
     const repositories = context.payload.repositories || [];
     for (const repository of repositories) {
-      await ensureRepositoryRebaseOnlyMerge(context, repository.owner.login, repository.name, repository);
+      await ensureRepositoryBaselineCompliance(context, repository.owner.login, repository.name, repository);
     }
   });
 
   app.on("installation_repositories.added", async (context) => {
     const repositories = context.payload.repositories_added || [];
     for (const repository of repositories) {
-      await ensureRepositoryRebaseOnlyMerge(context, repository.owner.login, repository.name, repository);
+      await ensureRepositoryBaselineCompliance(context, repository.owner.login, repository.name, repository);
     }
   });
 
@@ -40,7 +43,7 @@ module.exports = (app) => {
     const repo = repository.name;
     const types = getConfiguredTypes();
 
-    await ensureRepositoryRebaseOnlyMerge(context, owner, repo, repository);
+    await ensureRepositoryBaselineCompliance(context, owner, repo, repository);
 
     const existingType = await getIssueTypeName(context, owner, repo, issue);
     if (existingType) {
@@ -70,7 +73,7 @@ module.exports = (app) => {
 
   app.on("issue_comment.created", async (context) => {
     const { issue, repository, comment } = context.payload;
-    await ensureRepositoryRebaseOnlyMerge(context, repository.owner.login, repository.name, repository);
+    await ensureRepositoryBaselineCompliance(context, repository.owner.login, repository.name, repository);
 
     if (issue.pull_request) {
       if (parseRecheckCommand(comment.body || "")) {
@@ -123,7 +126,7 @@ module.exports = (app) => {
     const repo = repository.name;
     const types = getConfiguredTypes();
 
-    await ensureRepositoryRebaseOnlyMerge(context, owner, repo, repository);
+    await ensureRepositoryBaselineCompliance(context, owner, repo, repository);
 
     let issueType = await getIssueTypeName(context, owner, repo, issue);
 
@@ -203,7 +206,7 @@ module.exports = (app) => {
 
   app.on("create", async (context) => {
     const { repository, ref, ref_type: refType } = context.payload;
-    await ensureRepositoryRebaseOnlyMerge(context, repository.owner.login, repository.name, repository);
+    await ensureRepositoryBaselineCompliance(context, repository.owner.login, repository.name, repository);
 
     if (refType !== "branch") {
       return;
@@ -241,14 +244,14 @@ module.exports = (app) => {
     ],
     async (context) => {
       const repository = context.payload.repository;
-      await ensureRepositoryRebaseOnlyMerge(context, repository.owner.login, repository.name, repository);
+      await ensureRepositoryBaselineCompliance(context, repository.owner.login, repository.name, repository);
       await evaluatePullRequestCompliance(context);
     }
   );
 
   app.on(["pull_request.unlabeled", "pull_request.labeled"], async (context) => {
     const { pull_request: pullRequest, repository, action, label } = context.payload;
-    await ensureRepositoryRebaseOnlyMerge(context, repository.owner.login, repository.name, repository);
+    await ensureRepositoryBaselineCompliance(context, repository.owner.login, repository.name, repository);
 
     const labelName = normalizeType(label?.name);
 
@@ -1343,6 +1346,107 @@ async function ensureRepositoryRebaseOnlyMerge(context, owner, repo, repositoryF
   }
 }
 
+async function ensureRepositoryBaselineCompliance(context, owner, repo, repositoryFromPayload) {
+  await ensureRepositoryRebaseOnlyMerge(context, owner, repo, repositoryFromPayload);
+  await ensureDefaultBranchComplianceRuleset(context, owner, repo, repositoryFromPayload);
+}
+
+async function ensureDefaultBranchComplianceRuleset(context, owner, repo, repositoryFromPayload) {
+  const cacheKey = `${owner}/${repo}`.toLowerCase();
+  if (RULESET_ENFORCEMENT_CACHE.has(cacheKey)) {
+    return;
+  }
+
+  let repository = repositoryFromPayload;
+  if (!repository || !repository.default_branch) {
+    try {
+      const response = await context.octokit.repos.get({ owner, repo });
+      repository = response.data;
+    } catch (error) {
+      context.log.warn({ error, owner, repo }, "Unable to read repository before ruleset enforcement");
+      return;
+    }
+  }
+
+  const defaultBranch = repository.default_branch;
+
+  try {
+    const rulesets = await context.octokit.paginate(context.octokit.request, "GET /repos/{owner}/{repo}/rulesets", {
+      owner,
+      repo,
+      includes_parents: false,
+      per_page: 100,
+    });
+
+    const alreadyCovered = rulesets.some((ruleset) => isRulesetEnforcingComplianceCheck(ruleset, defaultBranch));
+    if (alreadyCovered) {
+      RULESET_ENFORCEMENT_CACHE.add(cacheKey);
+      return;
+    }
+
+    await context.octokit.request("POST /repos/{owner}/{repo}/rulesets", {
+      owner,
+      repo,
+      name: DEFAULT_BRANCH_RULESET_NAME,
+      target: "branch",
+      enforcement: "active",
+      conditions: {
+        ref_name: {
+          include: ["~DEFAULT_BRANCH"],
+          exclude: [],
+        },
+      },
+      rules: [
+        {
+          type: "required_status_checks",
+          parameters: {
+            strict_required_status_checks_policy: true,
+            do_not_enforce_on_create: false,
+            required_status_checks: [
+              {
+                context: PR_CHECK_NAME,
+              },
+            ],
+          },
+        },
+      ],
+      bypass_actors: [],
+    });
+
+    RULESET_ENFORCEMENT_CACHE.add(cacheKey);
+    context.log.info({ owner, repo, defaultBranch }, "Created default-branch compliance ruleset requiring bot check");
+  } catch (error) {
+    context.log.warn({ error, owner, repo }, "Unable to ensure default-branch compliance ruleset");
+  }
+}
+
+function isRulesetEnforcingComplianceCheck(ruleset, defaultBranch) {
+  if (!ruleset || normalizeType(ruleset.target) !== "branch" || normalizeType(ruleset.enforcement) !== "active") {
+    return false;
+  }
+
+  const include = ruleset?.conditions?.ref_name?.include || [];
+  const defaultBranchCovered = include.includes("~DEFAULT_BRANCH") || include.includes(`refs/heads/${defaultBranch}`);
+  if (!defaultBranchCovered) {
+    return false;
+  }
+
+  const rules = Array.isArray(ruleset.rules) ? ruleset.rules : [];
+  for (const rule of rules) {
+    if (normalizeType(rule?.type) !== "required_status_checks") {
+      continue;
+    }
+
+    const checks = rule?.parameters?.required_status_checks || [];
+    const hasComplianceCheck = checks.some((check) => normalizeType(check?.context) === normalizeType(PR_CHECK_NAME));
+    if (hasComplianceCheck) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function isRebasePolicyBackfillEnabled() {
   return normalizeType(process.env.REBASE_POLICY_BACKFILL_ON_STARTUP || "true") !== "false";
 }
@@ -1363,6 +1467,15 @@ async function backfillRebaseOnlyMergePolicy(app) {
 
       for (const repository of repositories) {
         await ensureRepositoryRebaseOnlyMerge(
+          {
+            octokit: installationOctokit,
+            log: app.log,
+          },
+          repository.owner.login,
+          repository.name,
+          repository
+        );
+        await ensureDefaultBranchComplianceRuleset(
           {
             octokit: installationOctokit,
             log: app.log,
