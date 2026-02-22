@@ -15,6 +15,7 @@ This repository is **Docker-only** for production deployment.
 - Enforces automatic head-branch deletion after merge:
   - `delete_branch_on_merge = true`
 - Runs on startup (one-time backfill across installed repos), on install, when repositories are added to the app, and during normal bot webhook activity.
+- Optionally polls GitHub App webhook delivery history and requests redelivery for failed deliveries (for downtime recovery).
 - Ensures default branch has an active ruleset requiring:
   - pull requests before merge, with only `rebase` allowed in the PR rule
   - status check `KumpeApps PR Compliance`
@@ -286,6 +287,10 @@ cp .env.example .env
 - `SECRET_SCANNING_GATES_ENABLED`
 - `LOCAL_SECRET_SCANNING_ENABLED`
 - `REBASE_POLICY_BACKFILL_ON_STARTUP` (set `false` to disable startup sweep)
+- `WEBHOOK_RECOVERY_ENABLED` (set `true` to enable failed webhook redelivery poller)
+- `WEBHOOK_RECOVERY_INTERVAL_MINUTES` (poll cadence, default `5`)
+- `WEBHOOK_RECOVERY_LOOKBACK_HOURS` (history window to scan, default `24`)
+- `WEBHOOK_RECOVERY_MAX_ATTEMPTS` (max redelivery requests per failed delivery ID, default `3`)
 
 4. Start:
 
@@ -307,6 +312,10 @@ From [.env.example](.env.example):
 - `SECRET_SCANNING_GATES_ENABLED` (default `true`)
 - `LOCAL_SECRET_SCANNING_ENABLED` (default `true`)
 - `REBASE_POLICY_BACKFILL_ON_STARTUP` (default `true`)
+- `WEBHOOK_RECOVERY_ENABLED` (default `false`)
+- `WEBHOOK_RECOVERY_INTERVAL_MINUTES` (default `5`)
+- `WEBHOOK_RECOVERY_LOOKBACK_HOURS` (default `24`)
+- `WEBHOOK_RECOVERY_MAX_ATTEMPTS` (default `3`)
 
 ## Verify image signatures
 
@@ -340,6 +349,7 @@ docker compose pull && docker compose up -d
   - Verify GitHub App permissions and installation scope.
 - Webhooks not arriving:
   - Check GitHub App webhook delivery logs and WAF/proxy routing.
+  - Optional: enable `WEBHOOK_RECOVERY_ENABLED=true` to have the bot request redelivery of failed app webhook deliveries.
 - PR checks not publishing:
   - Confirm Checks + Commit statuses permissions are `Read and write`.
 - Security gate fails unexpectedly:
