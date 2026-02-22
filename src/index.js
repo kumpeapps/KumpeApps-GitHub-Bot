@@ -1,3 +1,5 @@
+const yaml = require("js-yaml");
+
 const ALLOWED_ISSUE_TYPES = ["bug", "feature", "task"];
 const PR_CHECK_NAME = "KumpeApps PR Compliance";
 const PR_COMPLIANCE_MARKER = "<!-- kumpeapps-pr-compliance -->";
@@ -22,6 +24,9 @@ const TYPE_KEYWORDS = {
 };
 
 const RULESET_ENFORCEMENT_CACHE = new Set();
+const REPO_POLICY_CACHE = new Map();
+const REPO_POLICY_CACHE_TTL_MS = 60 * 1000;
+const REPO_POLICY_PATHS = [".github/kumpeapps-bot.yml", ".github/kumpeapps-bot.yaml"];
 
 module.exports = (app) => {
   app.on("installation.created", async (context) => {
@@ -62,11 +67,12 @@ module.exports = (app) => {
     const { issue, repository } = context.payload;
     const owner = repository.owner.login;
     const repo = repository.name;
-    const types = getConfiguredTypes();
+    const policy = await getRepositoryPolicy(context, owner, repo, repository);
+    const types = policy.issueTypes;
 
     await ensureRepositoryBaselineCompliance(context, owner, repo, repository);
 
-    const existingType = await getIssueTypeName(context, owner, repo, issue);
+    const existingType = await getIssueTypeName(context, owner, repo, issue, types);
     if (existingType) {
       return;
     }
@@ -108,7 +114,8 @@ module.exports = (app) => {
       return;
     }
 
-    const types = getConfiguredTypes();
+    const policy = await getRepositoryPolicy(context, repository.owner.login, repository.name, repository);
+    const types = policy.issueTypes;
     const normalizedType = normalizeType(typeFromComment);
 
     if (!types.includes(normalizedType)) {
@@ -145,11 +152,12 @@ module.exports = (app) => {
     const { issue, repository } = context.payload;
     const owner = repository.owner.login;
     const repo = repository.name;
-    const types = getConfiguredTypes();
+    const policy = await getRepositoryPolicy(context, owner, repo, repository);
+    const types = policy.issueTypes;
 
     await ensureRepositoryBaselineCompliance(context, owner, repo, repository);
 
-    let issueType = await getIssueTypeName(context, owner, repo, issue);
+    let issueType = await getIssueTypeName(context, owner, repo, issue, types);
 
     if (!issueType) {
       const guessedType = inferIssueType(issue.title, issue.body, types);
@@ -318,6 +326,8 @@ async function runPullRequestComplianceByNumber(context, owner, repo, pullNumber
 async function evaluatePullRequestComplianceCore(context, repository, pullRequest) {
   const owner = repository.owner.login;
   const repo = repository.name;
+  const policy = await getRepositoryPolicy(context, owner, repo, repository);
+  const allowedTypes = policy.issueTypes;
   const baseBranch = pullRequest.base.ref;
   const headBranch = pullRequest.head.ref;
   const headLabel = pullRequest.head.label;
@@ -344,7 +354,7 @@ async function evaluatePullRequestComplianceCore(context, repository, pullReques
     return;
   }
 
-  if (!["dev", "main", "master"].includes(baseBranch)) {
+  if (!policy.pullRequest.baseBranches.includes(normalizeType(baseBranch))) {
     await setPullRequestComplianceLabels(context, owner, repo, pullRequest.number, "none");
     await publishPullRequestComplianceCheck(context, {
       owner,
@@ -360,9 +370,10 @@ async function evaluatePullRequestComplianceCore(context, repository, pullReques
   const failures = [];
   const checks = [];
   const parsedBranch = parseTypeIssueBranch(headBranch);
-  const isDevPromotion = ["main", "master"].includes(baseBranch) && normalizeType(headBranch) === "dev";
+  const isDevPromotion =
+    policy.pullRequest.allowDevPromotion && ["main", "master"].includes(normalizeType(baseBranch)) && normalizeType(headBranch) === "dev";
 
-  const branchFormatPassed = Boolean(parsedBranch || isDevPromotion);
+  const branchFormatPassed = !policy.pullRequest.requireBranchNaming || Boolean(parsedBranch || isDevPromotion);
   if (!branchFormatPassed) {
     failures.push(
       `Source branch must follow \`type/issue_number\` (example: \`bug/12\`). For PRs into \`main\` or \`master\`, \`dev\` is also allowed.`
@@ -371,16 +382,18 @@ async function evaluatePullRequestComplianceCore(context, repository, pullReques
   checks.push({
     name: "Source branch naming policy",
     passed: branchFormatPassed,
-    detail: branchFormatPassed
+    detail: !policy.pullRequest.requireBranchNaming
+      ? "Disabled by repository override."
+      : branchFormatPassed
       ? `Using source branch \`${headBranch}\`.`
       : "Expected `type/issue_number` or `dev` when targeting main/master.",
   });
 
   if (parsedBranch) {
-    const allowedTypePassed = ALLOWED_ISSUE_TYPES.includes(parsedBranch.type);
+    const allowedTypePassed = allowedTypes.includes(parsedBranch.type);
     if (!allowedTypePassed) {
       failures.push(
-        `Branch type \`${parsedBranch.type}\` is not allowed. Use one of: ${ALLOWED_ISSUE_TYPES.map((type) => `\`${type}\``).join(", ")}.`
+        `Branch type \`${parsedBranch.type}\` is not allowed. Use one of: ${allowedTypes.map((type) => `\`${type}\``).join(", ")}.`
       );
     }
     checks.push({
@@ -388,37 +401,52 @@ async function evaluatePullRequestComplianceCore(context, repository, pullReques
       passed: allowedTypePassed,
       detail: allowedTypePassed
         ? `Branch type \`${parsedBranch.type}\` is allowed.`
-        : `Allowed values: ${ALLOWED_ISSUE_TYPES.map((type) => `\`${type}\``).join(", ")}.`,
+        : `Allowed values: ${allowedTypes.map((type) => `\`${type}\``).join(", ")}.`,
     });
 
-    const issueState = await getIssueState(context, owner, repo, parsedBranch.issueNumber);
-    let issueRulePassed = true;
-    let issueRuleDetail = `Issue #${parsedBranch.issueNumber} is open and matches branch type.`;
+    const issueChecksEnabled =
+      policy.pullRequest.requireIssueReference || policy.pullRequest.requireIssueOpen || policy.pullRequest.requireIssueTypeMatch;
 
-    if (issueState.notFound) {
-      failures.push(`Issue #${parsedBranch.issueNumber} does not exist in this repository.`);
-      issueRulePassed = false;
-      issueRuleDetail = `Issue #${parsedBranch.issueNumber} does not exist.`;
-    } else if (issueState.isPullRequest) {
-      failures.push(`Branch references #${parsedBranch.issueNumber}, but that number points to a pull request, not an issue.`);
-      issueRulePassed = false;
-      issueRuleDetail = `#${parsedBranch.issueNumber} points to a pull request, not an issue.`;
-    } else if (!issueState.isOpen) {
-      failures.push(`Issue #${parsedBranch.issueNumber} is not open.`);
-      issueRulePassed = false;
-      issueRuleDetail = `Issue #${parsedBranch.issueNumber} is not open.`;
-    } else {
-      const issueType = await getIssueTypeNameByNumber(context, owner, repo, parsedBranch.issueNumber);
-      if (!issueType) {
-        failures.push(`Issue #${parsedBranch.issueNumber} does not have a valid Type set (expected one of: ${ALLOWED_ISSUE_TYPES.join(", ")}).`);
+    let issueRulePassed = true;
+    let issueRuleDetail = issueChecksEnabled
+      ? `Issue #${parsedBranch.issueNumber} satisfies configured issue requirements.`
+      : "Disabled by repository override.";
+
+    if (issueChecksEnabled) {
+      const issueState = await getIssueState(context, owner, repo, parsedBranch.issueNumber);
+      const issueExistsAndIsIssue = !issueState.notFound && !issueState.isPullRequest;
+
+      if (policy.pullRequest.requireIssueReference && issueState.notFound) {
+        failures.push(`Issue #${parsedBranch.issueNumber} does not exist in this repository.`);
         issueRulePassed = false;
-        issueRuleDetail = `Issue #${parsedBranch.issueNumber} type is missing/invalid.`;
-      } else if (issueType !== parsedBranch.type) {
-        failures.push(
-          `Branch type \`${parsedBranch.type}\` must match issue #${parsedBranch.issueNumber} type \`${issueType}\`.`
-        );
+        issueRuleDetail = `Issue #${parsedBranch.issueNumber} does not exist.`;
+      } else if (policy.pullRequest.requireIssueReference && issueState.isPullRequest) {
+        failures.push(`Branch references #${parsedBranch.issueNumber}, but that number points to a pull request, not an issue.`);
         issueRulePassed = false;
-        issueRuleDetail = `Branch type \`${parsedBranch.type}\` does not match issue type \`${issueType}\`.`;
+        issueRuleDetail = `#${parsedBranch.issueNumber} points to a pull request, not an issue.`;
+      }
+
+      if (issueExistsAndIsIssue && policy.pullRequest.requireIssueOpen && !issueState.isOpen) {
+        failures.push(`Issue #${parsedBranch.issueNumber} is not open.`);
+        issueRulePassed = false;
+        issueRuleDetail = `Issue #${parsedBranch.issueNumber} is not open.`;
+      }
+
+      if (issueExistsAndIsIssue && policy.pullRequest.requireIssueTypeMatch) {
+        const issueType = await getIssueTypeNameByNumber(context, owner, repo, parsedBranch.issueNumber, allowedTypes);
+        if (!issueType) {
+          failures.push(
+            `Issue #${parsedBranch.issueNumber} does not have a valid Type set (expected one of: ${allowedTypes.join(", ")}).`
+          );
+          issueRulePassed = false;
+          issueRuleDetail = `Issue #${parsedBranch.issueNumber} type is missing/invalid.`;
+        } else if (issueType !== parsedBranch.type) {
+          failures.push(
+            `Branch type \`${parsedBranch.type}\` must match issue #${parsedBranch.issueNumber} type \`${issueType}\`.`
+          );
+          issueRulePassed = false;
+          issueRuleDetail = `Branch type \`${parsedBranch.type}\` does not match issue type \`${issueType}\`.`;
+        }
       }
     }
 
@@ -429,53 +457,82 @@ async function evaluatePullRequestComplianceCore(context, repository, pullReques
       passed: true,
       detail: "Not required for `dev` promotion into `main/master`.",
     });
+  } else if (policy.pullRequest.requireIssueReference || policy.pullRequest.requireIssueOpen || policy.pullRequest.requireIssueTypeMatch) {
+    failures.push("Branch does not map to `type/issue_number`, so issue requirements cannot be validated.");
+    checks.push({
+      name: "Referenced issue validity",
+      passed: false,
+      detail: "Expected `type/issue_number` branch to validate issue requirements.",
+    });
+  } else {
+    checks.push({
+      name: "Referenced issue validity",
+      passed: true,
+      detail: "Disabled by repository override.",
+    });
   }
 
-  const autoCloseResult = await ensureIssueAutocloseReference(
-    context,
-    owner,
-    repo,
-    pullRequest,
-    parsedBranch,
-    isDevPromotion
-  );
+  const autoCloseResult = policy.pullRequest.requireIssueAutoclose
+    ? await ensureIssueAutocloseReference(context, owner, repo, pullRequest, parsedBranch, isDevPromotion)
+    : {
+        passed: true,
+        detail: "Disabled by repository override.",
+        failures: [],
+      };
   checks.push({ name: "Issue auto-close link", passed: autoCloseResult.passed, detail: autoCloseResult.detail });
   if (!autoCloseResult.passed) {
     failures.push(...autoCloseResult.failures);
   }
 
-  const isRebased = await isHeadRebasedOnBase(context, owner, repo, baseBranch, headLabel);
-  if (!isRebased) {
+  const isRebased = policy.pullRequest.requireRebase ? await isHeadRebasedOnBase(context, owner, repo, baseBranch, headLabel) : true;
+  if (policy.pullRequest.requireRebase && !isRebased) {
     failures.push(`Source branch is not rebased onto \`${baseBranch}\`. Rebase your branch on top of the current base branch tip.`);
   }
   checks.push({
     name: "Rebased on target branch",
     passed: isRebased,
-    detail: isRebased ? `Branch is rebased on \`${baseBranch}\`.` : `Rebase required on \`${baseBranch}\`.`,
+    detail: !policy.pullRequest.requireRebase
+      ? "Disabled by repository override."
+      : isRebased
+      ? `Branch is rebased on \`${baseBranch}\`.`
+      : `Rebase required on \`${baseBranch}\`.`,
   });
 
   const commitCount = await getPullRequestCommitCount(context, owner, repo, pullRequest.number);
-  if (commitCount > 1) {
+  if (policy.pullRequest.requireSingleCommit && commitCount > 1) {
     failures.push(`PR must be squashed to a single commit. Found ${commitCount} commits.`);
   }
   checks.push({
     name: "Single commit (squash)",
-    passed: commitCount <= 1,
-    detail: `Found ${commitCount} commit${commitCount === 1 ? "" : "s"}.`,
+    passed: !policy.pullRequest.requireSingleCommit || commitCount <= 1,
+    detail: !policy.pullRequest.requireSingleCommit
+      ? "Disabled by repository override."
+      : `Found ${commitCount} commit${commitCount === 1 ? "" : "s"}.`,
   });
 
-  const commitPrefixFailures = await validateCommitMessagePrefix(context, owner, repo, pullRequest.number, headBranch);
+  const commitPrefixFailures = policy.pullRequest.requireCommitPrefix
+    ? await validateCommitMessagePrefix(context, owner, repo, pullRequest.number, headBranch)
+    : [];
   failures.push(...commitPrefixFailures);
   checks.push({
     name: "Commit message prefix",
     passed: commitPrefixFailures.length === 0,
     detail:
-      commitPrefixFailures.length === 0
+      !policy.pullRequest.requireCommitPrefix
+        ? "Disabled by repository override."
+        : commitPrefixFailures.length === 0
         ? `All commit subjects start with \`[${headBranch}] \`.`
         : `${commitPrefixFailures.length} commit message issue(s) found.`,
   });
 
-  const securityGateResult = await runSecurityGates(context, owner, repo, baseBranch, Boolean(repository.private));
+  const securityGateResult = await runSecurityGates(
+    context,
+    owner,
+    repo,
+    baseBranch,
+    Boolean(repository.private),
+    policy
+  );
   failures.push(...securityGateResult.failures);
   checks.push(...securityGateResult.ruleResults);
 
@@ -523,11 +580,240 @@ function getConfiguredTypes() {
   return ALLOWED_ISSUE_TYPES;
 }
 
-function isSecurityGateEnabled() {
+async function getRepositoryPolicy(context, owner, repo, repositoryFromPayload) {
+  const defaultPolicy = buildDefaultRepositoryPolicy();
+  if (!owner || !repo) {
+    return defaultPolicy;
+  }
+
+  const cacheKey = `${normalizeType(owner)}/${normalizeType(repo)}`;
+  const now = Date.now();
+  const cachedEntry = REPO_POLICY_CACHE.get(cacheKey);
+  if (cachedEntry && cachedEntry.expiresAt > now) {
+    return cachedEntry.policy;
+  }
+
+  let repository = repositoryFromPayload;
+  if (!repository || !repository.default_branch) {
+    try {
+      const response = await context.octokit.repos.get({ owner, repo });
+      repository = response.data;
+    } catch (error) {
+      context.log.warn({ error, owner, repo }, "Unable to read repository while loading policy overrides");
+      REPO_POLICY_CACHE.set(cacheKey, {
+        policy: defaultPolicy,
+        expiresAt: now + REPO_POLICY_CACHE_TTL_MS,
+      });
+      return defaultPolicy;
+    }
+  }
+
+  const defaultBranch = repository.default_branch;
+  let overrides = {};
+
+  for (const path of REPO_POLICY_PATHS) {
+    try {
+      const response = await context.octokit.repos.getContent({
+        owner,
+        repo,
+        path,
+        ref: defaultBranch,
+      });
+
+      const file = response?.data;
+      if (!file || Array.isArray(file) || file.type !== "file" || !file.content) {
+        continue;
+      }
+
+      const content = Buffer.from(file.content, file.encoding === "base64" ? "base64" : "utf8").toString("utf8");
+      const parsedYaml = yaml.load(content);
+      overrides = normalizeRepositoryPolicyOverrides(parsedYaml);
+      break;
+    } catch (error) {
+      if (error?.status === 404) {
+        continue;
+      }
+
+      context.log.warn({ error, owner, repo, path }, "Unable to load repository policy override file");
+      break;
+    }
+  }
+
+  const policy = mergeRepositoryPolicy(defaultPolicy, overrides);
+  REPO_POLICY_CACHE.set(cacheKey, {
+    policy,
+    expiresAt: now + REPO_POLICY_CACHE_TTL_MS,
+  });
+
+  return policy;
+}
+
+function buildDefaultRepositoryPolicy() {
+  return {
+    issueTypes: [...ALLOWED_ISSUE_TYPES],
+    enforcement: {
+      rebaseOnlyMerge: true,
+      defaultBranchRuleset: true,
+      requiredStatusCheck: true,
+      requireMergeQueue: true,
+      mergeQueueMethod: MERGE_QUEUE_REBASE_METHOD,
+    },
+    pullRequest: {
+      baseBranches: ["dev", "main", "master"],
+      allowDevPromotion: true,
+      requireBranchNaming: true,
+      requireIssueReference: true,
+      requireIssueOpen: true,
+      requireIssueTypeMatch: true,
+      requireIssueAutoclose: true,
+      requireRebase: true,
+      requireSingleCommit: true,
+      requireCommitPrefix: true,
+    },
+    security: {
+      dependabotGateEnabled: normalizeType(process.env.SECURITY_GATES_ENABLED || "true") !== "false",
+      secretScanningGateEnabled: normalizeType(process.env.SECRET_SCANNING_GATES_ENABLED || "true") !== "false",
+      minSeverity: normalizeSecuritySeverity(process.env.SECURITY_GATE_MIN_SEVERITY || "high"),
+    },
+  };
+}
+
+function normalizeRepositoryPolicyOverrides(rawConfig) {
+  if (!rawConfig || typeof rawConfig !== "object" || Array.isArray(rawConfig)) {
+    return {};
+  }
+
+  const source =
+    rawConfig.compliance && typeof rawConfig.compliance === "object" && !Array.isArray(rawConfig.compliance)
+      ? rawConfig.compliance
+      : rawConfig;
+
+  const issueTypes = normalizeStringArray(source.issue_types);
+
+  const baseBranches = normalizeStringArray(source?.pull_request?.base_branches);
+
+  return {
+    issueTypes,
+    enforcement: {
+      rebaseOnlyMerge: normalizeOptionalBoolean(source?.enforce?.rebase_only_merge),
+      defaultBranchRuleset: normalizeOptionalBoolean(source?.enforce?.default_branch_ruleset),
+      requiredStatusCheck: normalizeOptionalBoolean(source?.enforce?.required_status_check),
+      requireMergeQueue: normalizeOptionalBoolean(source?.enforce?.merge_queue),
+      mergeQueueMethod: normalizeMergeQueueMethod(source?.enforce?.merge_queue_method),
+    },
+    pullRequest: {
+      baseBranches,
+      allowDevPromotion: normalizeOptionalBoolean(source?.pull_request?.allow_dev_promotion),
+      requireBranchNaming: normalizeOptionalBoolean(source?.pull_request?.require_branch_naming),
+      requireIssueReference: normalizeOptionalBoolean(source?.pull_request?.require_issue_reference),
+      requireIssueOpen: normalizeOptionalBoolean(source?.pull_request?.require_issue_open),
+      requireIssueTypeMatch: normalizeOptionalBoolean(source?.pull_request?.require_issue_type_match),
+      requireIssueAutoclose: normalizeOptionalBoolean(source?.pull_request?.require_issue_autoclose),
+      requireRebase: normalizeOptionalBoolean(source?.pull_request?.require_rebase),
+      requireSingleCommit: normalizeOptionalBoolean(source?.pull_request?.require_single_commit),
+      requireCommitPrefix: normalizeOptionalBoolean(source?.pull_request?.require_commit_prefix),
+    },
+    security: {
+      dependabotGateEnabled: normalizeOptionalBoolean(source?.security?.dependabot_gate_enabled),
+      secretScanningGateEnabled: normalizeOptionalBoolean(source?.security?.secret_scanning_gate_enabled),
+      minSeverity: normalizeSecuritySeverity(source?.security?.min_severity),
+    },
+  };
+}
+
+function mergeRepositoryPolicy(defaultPolicy, overrides) {
+  const merged = {
+    issueTypes:
+      Array.isArray(overrides?.issueTypes) && overrides.issueTypes.length > 0
+        ? overrides.issueTypes
+        : defaultPolicy.issueTypes,
+    enforcement: {
+      ...defaultPolicy.enforcement,
+    },
+    pullRequest: {
+      ...defaultPolicy.pullRequest,
+    },
+    security: {
+      ...defaultPolicy.security,
+    },
+  };
+
+  for (const [key, value] of Object.entries(overrides?.enforcement || {})) {
+    if (typeof value !== "undefined") {
+      merged.enforcement[key] = value;
+    }
+  }
+
+  for (const [key, value] of Object.entries(overrides?.pullRequest || {})) {
+    if (typeof value !== "undefined") {
+      if (key === "baseBranches") {
+        merged.pullRequest.baseBranches = Array.isArray(value) && value.length > 0 ? value : defaultPolicy.pullRequest.baseBranches;
+      } else {
+        merged.pullRequest[key] = value;
+      }
+    }
+  }
+
+  for (const [key, value] of Object.entries(overrides?.security || {})) {
+    if (typeof value !== "undefined") {
+      merged.security[key] = value;
+    }
+  }
+
+  return merged;
+}
+
+function normalizeOptionalBoolean(value) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const normalized = normalizeType(value);
+    if (normalized === "true") {
+      return true;
+    }
+    if (normalized === "false") {
+      return false;
+    }
+  }
+
+  return undefined;
+}
+
+function normalizeStringArray(value) {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const normalized = [...new Set(value.map((item) => normalizeType(item)).filter(Boolean))];
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeSecuritySeverity(value) {
+  const normalized = normalizeType(value);
+  return SEVERITY_RANK[normalized] ? normalized : "high";
+}
+
+function normalizeMergeQueueMethod(value) {
+  const normalized = String(value || MERGE_QUEUE_REBASE_METHOD).trim().toUpperCase();
+  return ["MERGE", "SQUASH", "REBASE"].includes(normalized) ? normalized : MERGE_QUEUE_REBASE_METHOD;
+}
+
+function isSecurityGateEnabled(policy) {
+  if (typeof policy?.security?.dependabotGateEnabled === "boolean") {
+    return policy.security.dependabotGateEnabled;
+  }
+
   return normalizeType(process.env.SECURITY_GATES_ENABLED || "true") !== "false";
 }
 
-function getSecurityGateSeverityThreshold() {
+function getSecurityGateSeverityThreshold(policy) {
+  const overrideSeverity = normalizeType(policy?.security?.minSeverity);
+  if (SEVERITY_RANK[overrideSeverity]) {
+    return overrideSeverity;
+  }
+
   const raw = normalizeType(process.env.SECURITY_GATE_MIN_SEVERITY || "high");
   if (SEVERITY_RANK[raw]) {
     return raw;
@@ -597,14 +883,14 @@ function inferIssueType(title, body, allowedTypes) {
   return bestScore > 0 ? bestType : null;
 }
 
-async function getIssueTypeName(context, owner, repo, issue) {
+async function getIssueTypeName(context, owner, repo, issue, allowedTypes = ALLOWED_ISSUE_TYPES) {
   const fromPayload =
     normalizeType(issue?.type?.name) ||
     normalizeType(issue?.type) ||
     normalizeType(issue?.issue_type?.name) ||
     normalizeType(issue?.issue_type);
 
-  if (fromPayload && ALLOWED_ISSUE_TYPES.includes(fromPayload)) {
+  if (fromPayload && allowedTypes.includes(fromPayload)) {
     return fromPayload;
   }
 
@@ -629,7 +915,7 @@ async function getIssueTypeName(context, owner, repo, issue) {
     );
 
     const graphqlType = normalizeType(result?.repository?.issue?.issueType?.name);
-    if (graphqlType && ALLOWED_ISSUE_TYPES.includes(graphqlType)) {
+    if (graphqlType && allowedTypes.includes(graphqlType)) {
       return graphqlType;
     }
   } catch (error) {
@@ -696,7 +982,7 @@ async function getIssueState(context, owner, repo, issueNumber) {
   }
 }
 
-async function getIssueTypeNameByNumber(context, owner, repo, issueNumber) {
+async function getIssueTypeNameByNumber(context, owner, repo, issueNumber, allowedTypes = ALLOWED_ISSUE_TYPES) {
   try {
     const result = await context.octokit.graphql(
       `
@@ -718,7 +1004,7 @@ async function getIssueTypeNameByNumber(context, owner, repo, issueNumber) {
     );
 
     const issueType = normalizeType(result?.repository?.issue?.issueType?.name);
-    if (ALLOWED_ISSUE_TYPES.includes(issueType)) {
+    if (allowedTypes.includes(issueType)) {
       return issueType;
     }
 
@@ -1010,7 +1296,7 @@ async function publishPullRequestComplianceCheck(context, { owner, repo, headSha
   }
 }
 
-async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepository) {
+async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepository, policy) {
   const failures = [];
   const warnings = [];
   const ruleResults = [];
@@ -1022,13 +1308,13 @@ async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepos
     return { failures, warnings, ruleResults };
   }
 
-  if (!isSecurityGateEnabled()) {
+  if (!isSecurityGateEnabled(policy)) {
     ruleResults.push({ name: "Dependabot alert gate", passed: true, detail: "Disabled by SECURITY_GATES_ENABLED=false." });
     ruleResults.push({ name: "Secret-scanning alert gate", passed: true, detail: "Disabled by SECURITY_GATES_ENABLED=false." });
     return { failures, warnings, ruleResults };
   }
 
-  const threshold = getSecurityGateSeverityThreshold();
+  const threshold = getSecurityGateSeverityThreshold(policy);
   const alertResult = await getOpenDependabotAlerts(context, owner, repo);
 
   if (!alertResult.available) {
@@ -1073,7 +1359,7 @@ async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepos
     ruleResults.push({ name: "Dependabot alert gate", passed: false, detail: `${alertResult.reason}.` });
   }
 
-  if (isSecretScanningGateEnabled()) {
+  if (isSecretScanningGateEnabled(policy)) {
     const secretAlertResult = await getOpenSecretScanningAlerts(context, owner, repo);
 
     if (!secretAlertResult.available) {
@@ -1130,7 +1416,11 @@ async function getOpenDependabotAlerts(context, owner, repo) {
   }
 }
 
-function isSecretScanningGateEnabled() {
+function isSecretScanningGateEnabled(policy) {
+  if (typeof policy?.security?.secretScanningGateEnabled === "boolean") {
+    return policy.security.secretScanningGateEnabled;
+  }
+
   return normalizeType(process.env.SECRET_SCANNING_GATES_ENABLED || "true") !== "false";
 }
 
@@ -1331,9 +1621,13 @@ async function doesBranchExist(context, owner, repo, branch) {
   }
 }
 
-async function ensureRepositoryRebaseOnlyMerge(context, owner, repo, repositoryFromPayload) {
+async function ensureRepositoryRebaseOnlyMerge(context, owner, repo, repositoryFromPayload, policy) {
   if (!owner || !repo) {
     context.log.warn({ owner, repo }, "Skipping rebase-only enforcement due to missing owner/repo");
+    return;
+  }
+
+  if (!policy?.enforcement?.rebaseOnlyMerge) {
     return;
   }
 
@@ -1383,13 +1677,18 @@ async function ensureRepositoryRebaseOnlyMerge(context, owner, repo, repositoryF
 }
 
 async function ensureRepositoryBaselineCompliance(context, owner, repo, repositoryFromPayload) {
-  await ensureRepositoryRebaseOnlyMerge(context, owner, repo, repositoryFromPayload);
-  await ensureDefaultBranchComplianceRuleset(context, owner, repo, repositoryFromPayload);
+  const policy = await getRepositoryPolicy(context, owner, repo, repositoryFromPayload);
+  await ensureRepositoryRebaseOnlyMerge(context, owner, repo, repositoryFromPayload, policy);
+  await ensureDefaultBranchComplianceRuleset(context, owner, repo, repositoryFromPayload, policy);
 }
 
-async function ensureDefaultBranchComplianceRuleset(context, owner, repo, repositoryFromPayload) {
+async function ensureDefaultBranchComplianceRuleset(context, owner, repo, repositoryFromPayload, policy) {
   if (!owner || !repo) {
     context.log.warn({ owner, repo }, "Skipping ruleset enforcement due to missing owner/repo");
+    return;
+  }
+
+  if (!policy?.enforcement?.defaultBranchRuleset) {
     return;
   }
 
@@ -1419,7 +1718,7 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
       per_page: 100,
     });
 
-    const alreadyCovered = rulesets.some((ruleset) => isRulesetEnforcingComplianceRequirements(ruleset, defaultBranch));
+    const alreadyCovered = rulesets.some((ruleset) => isRulesetEnforcingComplianceRequirements(ruleset, defaultBranch, policy));
     if (alreadyCovered) {
       RULESET_ENFORCEMENT_CACHE.add(cacheKey);
       return;
@@ -1435,7 +1734,7 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
         target: "branch",
         enforcement: "active",
         conditions: buildDefaultBranchConditions(rulesetToRemediate.conditions, defaultBranch),
-        rules: buildComplianceRules(rulesetToRemediate.rules),
+        rules: buildComplianceRules(rulesetToRemediate.rules, policy),
         bypass_actors: Array.isArray(rulesetToRemediate.bypass_actors) ? rulesetToRemediate.bypass_actors : [],
       });
 
@@ -1459,26 +1758,7 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
           exclude: [],
         },
       },
-      rules: [
-        {
-          type: "required_status_checks",
-          parameters: {
-            strict_required_status_checks_policy: true,
-            do_not_enforce_on_create: false,
-            required_status_checks: [
-              {
-                context: PR_CHECK_NAME,
-              },
-            ],
-          },
-        },
-        {
-          type: "merge_queue",
-          parameters: {
-            merge_method: MERGE_QUEUE_REBASE_METHOD,
-          },
-        },
-      ],
+      rules: buildComplianceRules([], policy),
       bypass_actors: [],
     });
 
@@ -1501,7 +1781,7 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
   }
 }
 
-function isRulesetEnforcingComplianceRequirements(ruleset, defaultBranch) {
+function isRulesetEnforcingComplianceRequirements(ruleset, defaultBranch, policy) {
   if (!ruleset || normalizeType(ruleset.target) !== "branch" || normalizeType(ruleset.enforcement) !== "active") {
     return false;
   }
@@ -1514,7 +1794,8 @@ function isRulesetEnforcingComplianceRequirements(ruleset, defaultBranch) {
 
   const rules = Array.isArray(ruleset.rules) ? ruleset.rules : [];
   let hasComplianceCheck = false;
-  let hasRebaseMergeQueue = false;
+  let hasRequiredMergeQueue = false;
+  const requiredMergeQueueMethod = normalizeMergeQueueMethod(policy?.enforcement?.mergeQueueMethod);
 
   for (const rule of rules) {
     const ruleType = normalizeType(rule?.type);
@@ -1525,12 +1806,17 @@ function isRulesetEnforcingComplianceRequirements(ruleset, defaultBranch) {
     }
 
     if (ruleType === "merge_queue") {
-      hasRebaseMergeQueue =
-        normalizeType(rule?.parameters?.merge_method) === normalizeType(MERGE_QUEUE_REBASE_METHOD);
+      hasRequiredMergeQueue =
+        String(rule?.parameters?.merge_method || "")
+          .trim()
+          .toUpperCase() === requiredMergeQueueMethod;
     }
   }
 
-  return hasComplianceCheck && hasRebaseMergeQueue;
+  const requiredStatusSatisfied = policy?.enforcement?.requiredStatusCheck ? hasComplianceCheck : true;
+  const mergeQueueSatisfied = policy?.enforcement?.requireMergeQueue ? hasRequiredMergeQueue : true;
+
+  return requiredStatusSatisfied && mergeQueueSatisfied;
 }
 
 function findRulesetForComplianceRemediation(rulesets, defaultBranch) {
@@ -1574,7 +1860,7 @@ function buildDefaultBranchConditions(existingConditions, defaultBranch) {
   };
 }
 
-function buildComplianceRules(existingRules) {
+function buildComplianceRules(existingRules, policy) {
   const rules = Array.isArray(existingRules) ? existingRules : [];
   const passthroughRules = [];
   let requiredStatusRule = null;
@@ -1604,25 +1890,29 @@ function buildComplianceRules(existingRules) {
     ? existingChecks
     : [...existingChecks, { context: PR_CHECK_NAME }];
 
-  const requiredStatusRuleOutput = {
-    type: "required_status_checks",
-    parameters: {
-      ...requiredStatusRule?.parameters,
-      strict_required_status_checks_policy: true,
-      do_not_enforce_on_create: false,
-      required_status_checks: mergedChecks,
-    },
-  };
+  if (policy?.enforcement?.requiredStatusCheck) {
+    passthroughRules.push({
+      type: "required_status_checks",
+      parameters: {
+        ...requiredStatusRule?.parameters,
+        strict_required_status_checks_policy: true,
+        do_not_enforce_on_create: false,
+        required_status_checks: mergedChecks,
+      },
+    });
+  }
 
-  const mergeQueueRuleOutput = {
-    type: "merge_queue",
-    parameters: {
-      ...mergeQueueRule?.parameters,
-      merge_method: MERGE_QUEUE_REBASE_METHOD,
-    },
-  };
+  if (policy?.enforcement?.requireMergeQueue) {
+    passthroughRules.push({
+      type: "merge_queue",
+      parameters: {
+        ...mergeQueueRule?.parameters,
+        merge_method: normalizeMergeQueueMethod(policy?.enforcement?.mergeQueueMethod),
+      },
+    });
+  }
 
-  return [...passthroughRules, requiredStatusRuleOutput, mergeQueueRuleOutput];
+  return passthroughRules;
 }
 
 function isRebasePolicyBackfillEnabled() {
@@ -1651,7 +1941,7 @@ async function backfillRebaseOnlyMergePolicy(app) {
           continue;
         }
 
-        await ensureRepositoryRebaseOnlyMerge(
+        const policy = await getRepositoryPolicy(
           {
             octokit: installationOctokit,
             log: app.log,
@@ -1660,6 +1950,17 @@ async function backfillRebaseOnlyMergePolicy(app) {
           repository.name,
           repository
         );
+
+        await ensureRepositoryRebaseOnlyMerge(
+          {
+            octokit: installationOctokit,
+            log: app.log,
+          },
+          owner,
+          repository.name,
+          repository,
+          policy
+        );
         await ensureDefaultBranchComplianceRuleset(
           {
             octokit: installationOctokit,
@@ -1667,7 +1968,8 @@ async function backfillRebaseOnlyMergePolicy(app) {
           },
           owner,
           repository.name,
-          repository
+          repository,
+          policy
         );
       }
     }

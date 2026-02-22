@@ -15,6 +15,67 @@ This repository is **Docker-only** for production deployment.
 - Runs on startup (one-time backfill across installed repos), on install, when repositories are added to the app, and during normal bot webhook activity.
 - Ensures default branch has an active ruleset requiring status check `KumpeApps PR Compliance` and merge queue with rebase merge before merge (creates one if missing).
 
+### Repository-level overrides (`.yml`)
+
+You can override requirements per repository by adding one of these files on the default branch:
+
+- `.github/kumpeapps-bot.yml`
+- `.github/kumpeapps-bot.yaml`
+
+Schema (all keys optional):
+
+```yaml
+compliance:
+  issue_types: [bug, feature, task]
+
+  enforce:
+    rebase_only_merge: true
+    default_branch_ruleset: true
+    required_status_check: true
+    merge_queue: true
+    merge_queue_method: REBASE # REBASE | MERGE | SQUASH
+
+  pull_request:
+    base_branches: [dev, main, master]
+    allow_dev_promotion: true
+    require_branch_naming: true
+    require_issue_reference: true
+    require_issue_open: true
+    require_issue_type_match: true
+    require_issue_autoclose: true
+    require_rebase: true
+    require_single_commit: true
+    require_commit_prefix: true
+
+  security:
+    dependabot_gate_enabled: true
+    secret_scanning_gate_enabled: true
+    min_severity: high # low | medium | high | critical
+```
+
+Example override (disable single-commit + commit-prefix in one repo):
+
+```yaml
+compliance:
+  pull_request:
+    require_single_commit: false
+    require_commit_prefix: false
+```
+
+Example override (disable merge queue requirement for one repo ruleset):
+
+```yaml
+compliance:
+  enforce:
+    merge_queue: false
+```
+
+Notes:
+- If no override file exists, bot defaults are used.
+- Overrides are cached briefly in-memory (~60s) before re-read.
+- Invalid values fall back to defaults.
+- This repo includes [.github/kumpeapps-bot.yml](.github/kumpeapps-bot.yml) with default-equivalent values, so it does not change behavior here.
+
 ### Issues
 
 On `issues.opened`:
