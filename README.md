@@ -83,6 +83,7 @@ Notes:
 - This repo includes [.github/kumpeapps-bot.yml](.github/kumpeapps-bot.yml) with default-equivalent values, so it does not change behavior here.
 - If GitHub rulesets are unavailable for a repository plan/visibility (for example private repo without GitHub Pro), bot skips ruleset enforcement for that repo and continues other compliance features.
 - Archived repositories are automatically skipped for all automation and enforcement.
+- When a repository visibility/state changes (for example private → public), bot refreshes cache and re-applies baseline requirements on repository events.
 
 ### Issues
 
@@ -177,6 +178,7 @@ https://YOUR_PUBLIC_DOMAIN[:PORT]/api/github/webhooks
   - `installation`
   - `installation_repositories`
   - `create`
+  - `repository`
 6. Create app and download private key (`.pem`).
 7. Note your `APP_ID`.
 

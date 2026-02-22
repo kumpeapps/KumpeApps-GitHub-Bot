@@ -359,6 +359,26 @@ module.exports = (app) => {
     }
   });
 
+  app.on(["repository.edited", "repository.publicized", "repository.privatized", "repository.unarchived"], async (context) => {
+    const repository = context.payload.repository;
+    const owner = repository?.owner?.login;
+    const repo = repository?.name;
+
+    if (!owner || !repo) {
+      context.log.warn({ repository }, "Skipping repository state-change enforcement due to missing owner/repo");
+      return;
+    }
+
+    clearRepositoryCaches(owner, repo);
+
+    if (isRepositoryArchived(repository)) {
+      logArchivedRepositorySkip(context.log, owner, repo, context.name);
+      return;
+    }
+
+    await ensureRepositoryBaselineCompliance(context, owner, repo, repository);
+  });
+
   if (isRebasePolicyBackfillEnabled()) {
     void backfillRebaseOnlyMergePolicy(app);
   }
@@ -648,7 +668,7 @@ async function getRepositoryPolicy(context, owner, repo, repositoryFromPayload) 
     return defaultPolicy;
   }
 
-  const cacheKey = `${normalizeType(owner)}/${normalizeType(repo)}`;
+  const cacheKey = buildRepositoryCacheKey(owner, repo);
   const now = Date.now();
   const cachedEntry = REPO_POLICY_CACHE.get(cacheKey);
   if (cachedEntry && cachedEntry.expiresAt > now) {
@@ -1763,7 +1783,7 @@ async function ensureDefaultBranchComplianceRuleset(context, owner, repo, reposi
     return;
   }
 
-  const cacheKey = `${owner}/${repo}`.toLowerCase();
+  const cacheKey = buildRepositoryCacheKey(owner, repo);
   if (RULESET_UNSUPPORTED_CACHE.has(cacheKey)) {
     return;
   }
@@ -2245,6 +2265,17 @@ function logRulesetUnsupportedSummary(logger) {
     },
     "Ruleset enforcement skipped for repositories where the rulesets feature is unavailable"
   );
+}
+
+function buildRepositoryCacheKey(owner, repo) {
+  return `${normalizeType(owner)}/${normalizeType(repo)}`;
+}
+
+function clearRepositoryCaches(owner, repo) {
+  const cacheKey = buildRepositoryCacheKey(owner, repo);
+  RULESET_ENFORCEMENT_CACHE.delete(cacheKey);
+  RULESET_UNSUPPORTED_CACHE.delete(cacheKey);
+  REPO_POLICY_CACHE.delete(cacheKey);
 }
 
 function isRepositoryArchived(repository) {
