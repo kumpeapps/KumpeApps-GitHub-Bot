@@ -580,19 +580,23 @@ async function evaluatePullRequestComplianceCore(context, repository, pullReques
       : `Rebase required on \`${baseBranch}\`.`,
   });
 
+  const requireSingleCommit = policy.pullRequest.requireSingleCommit && !isDevPromotion;
   const commitCount = await getPullRequestCommitCount(context, owner, repo, pullRequest.number);
-  if (policy.pullRequest.requireSingleCommit && commitCount > 1) {
+  if (requireSingleCommit && commitCount > 1) {
     failures.push(`PR must be squashed to a single commit. Found ${commitCount} commits.`);
   }
   checks.push({
     name: "Single commit (squash)",
-    passed: !policy.pullRequest.requireSingleCommit || commitCount <= 1,
+    passed: !requireSingleCommit || commitCount <= 1,
     detail: !policy.pullRequest.requireSingleCommit
       ? "Disabled by repository override."
+      : isDevPromotion
+      ? "Not required for `dev` promotion into `main/master`."
       : `Found ${commitCount} commit${commitCount === 1 ? "" : "s"}.`,
   });
 
-  const commitPrefixFailures = policy.pullRequest.requireCommitPrefix
+  const requireCommitPrefix = policy.pullRequest.requireCommitPrefix && !isDevPromotion;
+  const commitPrefixFailures = requireCommitPrefix
     ? await validateCommitMessagePrefix(context, owner, repo, pullRequest.number, headBranch)
     : [];
   failures.push(...commitPrefixFailures);
@@ -602,6 +606,8 @@ async function evaluatePullRequestComplianceCore(context, repository, pullReques
     detail:
       !policy.pullRequest.requireCommitPrefix
         ? "Disabled by repository override."
+        : isDevPromotion
+        ? "Not required for `dev` promotion into `main/master`."
         : commitPrefixFailures.length === 0
         ? `All commit subjects start with \`[${headBranch}] \`.`
         : `${commitPrefixFailures.length} commit message issue(s) found.`,
@@ -613,7 +619,8 @@ async function evaluatePullRequestComplianceCore(context, repository, pullReques
     repo,
     baseBranch,
     Boolean(repository.private),
-    policy
+    policy,
+    pullRequest
   );
   failures.push(...securityGateResult.failures);
   checks.push(...securityGateResult.ruleResults);
@@ -1384,11 +1391,19 @@ async function publishPullRequestComplianceCheck(context, { owner, repo, headSha
   }
 }
 
-async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepository, policy) {
+async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepository, policy, pullRequest) {
   const failures = [];
   const warnings = [];
   const ruleResults = [];
   const normalizedBase = normalizeType(baseBranch);
+  let remediationSignalsPromise = null;
+
+  const getRemediationSignals = async () => {
+    if (!remediationSignalsPromise) {
+      remediationSignalsPromise = detectPullRequestSecurityRemediationSignals(context, owner, repo, pullRequest);
+    }
+    return remediationSignalsPromise;
+  };
 
   if (isPrivateRepository) {
     ruleResults.push({ name: "Dependabot alert gate", passed: true, detail: "Skipped for private repositories." });
@@ -1422,13 +1437,22 @@ async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepos
         .join(", ");
 
       const message = `Security gate failed: ${blockingAlerts.length} open Dependabot alert(s) at or above \`${threshold}\` severity. Example(s): ${preview}.`;
+      const remediationSignals = await getRemediationSignals();
+      const treatAsWarning = normalizedBase === "dev" || remediationSignals.dependabotLikelyFix;
 
-      if (normalizedBase === "dev") {
-        warnings.push(message.replace("failed", "warning (non-blocking on dev)"));
+      if (treatAsWarning) {
+        warnings.push(
+          normalizedBase === "dev"
+            ? message.replace("failed", "warning (non-blocking on dev)")
+            : `${message} Treated as warning because this PR appears to remediate dependency/security alerts.`
+        );
         ruleResults.push({
           name: "Dependabot alert gate",
           passed: true,
-          detail: `${blockingAlerts.length} alert(s) found at/above threshold (warning-only on dev).`,
+          detail:
+            normalizedBase === "dev"
+              ? `${blockingAlerts.length} alert(s) found at/above threshold (warning-only on dev).`
+              : `${blockingAlerts.length} alert(s) found at/above threshold (warning-only for remediation PR).`,
         });
       } else {
         failures.push(message);
@@ -1461,14 +1485,28 @@ async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepos
         .map((alert) => `#${alert.number}`)
         .join(", ");
 
-      failures.push(
-        `Security gate failed: ${secretAlertResult.alerts.length} open secret-scanning alert(s). Example(s): ${preview}.`
-      );
-      ruleResults.push({
-        name: "Secret-scanning alert gate",
-        passed: false,
-        detail: `${secretAlertResult.alerts.length} open secret-scanning alert(s) found.`,
-      });
+      const remediationSignals = await getRemediationSignals();
+      const isLikelySecretRemediation = remediationSignals.secretLikelyFix;
+
+      if (isLikelySecretRemediation) {
+        warnings.push(
+          `Security gate warning: ${secretAlertResult.alerts.length} open secret-scanning alert(s). Example(s): ${preview}. Treated as warning because this PR appears to remediate secret exposure issues.`
+        );
+        ruleResults.push({
+          name: "Secret-scanning alert gate",
+          passed: true,
+          detail: `${secretAlertResult.alerts.length} open secret-scanning alert(s) found (warning-only for remediation PR).`,
+        });
+      } else {
+        failures.push(
+          `Security gate failed: ${secretAlertResult.alerts.length} open secret-scanning alert(s). Example(s): ${preview}.`
+        );
+        ruleResults.push({
+          name: "Secret-scanning alert gate",
+          passed: false,
+          detail: `${secretAlertResult.alerts.length} open secret-scanning alert(s) found.`,
+        });
+      }
     } else {
       ruleResults.push({ name: "Secret-scanning alert gate", passed: true, detail: "No open secret-scanning alerts found." });
     }
@@ -1477,6 +1515,92 @@ async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepos
   }
 
   return { failures, warnings, ruleResults };
+}
+
+async function detectPullRequestSecurityRemediationSignals(context, owner, repo, pullRequest) {
+  const title = String(pullRequest?.title || "");
+  const body = String(pullRequest?.body || "");
+  const headBranch = String(pullRequest?.head?.ref || "");
+  const text = `${title}\n${body}\n${headBranch}`;
+
+  const dependabotTextSignal = /(dependabot|vulnerab|security\s*(fix|update|patch)?|ghsa-|cve-\d{4}-\d+)/i.test(text);
+  const secretTextSignal = /(secret|credential|token|api\s*key|private\s*key|rotate|revoke|leak|expos)/i.test(text);
+
+  let dependabotFileSignal = false;
+  let secretFileSignal = false;
+
+  const pullNumber = Number(pullRequest?.number || 0);
+  if (pullNumber > 0) {
+    try {
+      const files = await context.octokit.paginate(context.octokit.pulls.listFiles, {
+        owner,
+        repo,
+        pull_number: pullNumber,
+        per_page: 100,
+      });
+
+      dependabotFileSignal = files.some((file) => isDependencyOrLockfile(file?.filename));
+      secretFileSignal = files.some((file) => isPotentialSecretRemediationFile(file?.filename));
+    } catch (error) {
+      context.log.warn({ error, owner, repo, pullNumber }, "Unable to inspect PR files for security remediation signals");
+    }
+  }
+
+  return {
+    dependabotLikelyFix: dependabotTextSignal || dependabotFileSignal,
+    secretLikelyFix: secretTextSignal || secretFileSignal,
+  };
+}
+
+function isDependencyOrLockfile(filename) {
+  const file = normalizeType(filename);
+  if (!file) {
+    return false;
+  }
+
+  return [
+    /(^|\/)package\.json$/,
+    /(^|\/)package-lock\.json$/,
+    /(^|\/)npm-shrinkwrap\.json$/,
+    /(^|\/)yarn\.lock$/,
+    /(^|\/)pnpm-lock\.ya?ml$/,
+    /(^|\/)composer\.json$/,
+    /(^|\/)composer\.lock$/,
+    /(^|\/)pipfile$/,
+    /(^|\/)pipfile\.lock$/,
+    /(^|\/)poetry\.lock$/,
+    /(^|\/)requirements[^/]*\.txt$/,
+    /(^|\/)gemfile$/,
+    /(^|\/)gemfile\.lock$/,
+    /(^|\/)cargo\.toml$/,
+    /(^|\/)cargo\.lock$/,
+    /(^|\/)go\.mod$/,
+    /(^|\/)go\.sum$/,
+    /(^|\/)pom\.xml$/,
+    /(^|\/)build\.gradle(\.kts)?$/,
+    /(^|\/)gradle\.properties$/,
+    /(^|\/)dependencies\.(json|ya?ml)$/,
+  ].some((pattern) => pattern.test(file));
+}
+
+function isPotentialSecretRemediationFile(filename) {
+  const file = normalizeType(filename);
+  if (!file) {
+    return false;
+  }
+
+  return [
+    /(^|\/)\.env(\.|$)/,
+    /secret/,
+    /credential/,
+    /token/,
+    /private[_-]?key/,
+    /id_rsa/,
+    /\.pem$/,
+    /\.p12$/,
+    /\.pfx$/,
+    /(^|\/)\.github\/workflows\//,
+  ].some((pattern) => pattern.test(file));
 }
 
 async function getOpenDependabotAlerts(context, owner, repo) {
