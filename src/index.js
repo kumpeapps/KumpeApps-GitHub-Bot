@@ -735,6 +735,7 @@ function buildDefaultRepositoryPolicy() {
     issueTypes: [...ALLOWED_ISSUE_TYPES],
     enforcement: {
       rebaseOnlyMerge: true,
+      deleteBranchOnMerge: true,
       defaultBranchRuleset: true,
       requirePullRequest: true,
       pullRequestAllowedMergeMethods: ["rebase"],
@@ -780,6 +781,7 @@ function normalizeRepositoryPolicyOverrides(rawConfig) {
     issueTypes,
     enforcement: {
       rebaseOnlyMerge: normalizeOptionalBoolean(source?.enforce?.rebase_only_merge),
+      deleteBranchOnMerge: normalizeOptionalBoolean(source?.enforce?.delete_branch_on_merge),
       defaultBranchRuleset: normalizeOptionalBoolean(source?.enforce?.default_branch_ruleset),
       requirePullRequest: normalizeOptionalBoolean(source?.enforce?.require_pull_request),
       pullRequestAllowedMergeMethods: normalizeAllowedPullRequestMergeMethods(source?.enforce?.pull_request_allowed_merge_methods),
@@ -1713,7 +1715,10 @@ async function ensureRepositoryRebaseOnlyMerge(context, owner, repo, repositoryF
     return;
   }
 
-  if (!policy?.enforcement?.rebaseOnlyMerge) {
+  const shouldEnforceRebaseOnlyMerge = policy?.enforcement?.rebaseOnlyMerge !== false;
+  const shouldDeleteHeadBranchesOnMerge = policy?.enforcement?.deleteBranchOnMerge !== false;
+
+  if (!shouldEnforceRebaseOnlyMerge && !shouldDeleteHeadBranchesOnMerge) {
     return;
   }
 
@@ -1732,21 +1737,46 @@ async function ensureRepositoryRebaseOnlyMerge(context, owner, repo, repositoryF
   const allowMergeCommit = repository.allow_merge_commit === true;
   const allowSquashMerge = repository.allow_squash_merge === true;
   const allowRebaseMerge = repository.allow_rebase_merge === true;
+  const deleteBranchOnMergeEnabled = repository.delete_branch_on_merge === true;
 
-  if (!allowMergeCommit && !allowSquashMerge && allowRebaseMerge) {
+  const needsRebaseOnlyMergeUpdate = shouldEnforceRebaseOnlyMerge && (allowMergeCommit || allowSquashMerge || !allowRebaseMerge);
+  const needsDeleteBranchUpdate = shouldDeleteHeadBranchesOnMerge && !deleteBranchOnMergeEnabled;
+
+  if (!needsRebaseOnlyMergeUpdate && !needsDeleteBranchUpdate) {
     return;
   }
 
   try {
-    await context.octokit.repos.update({
+    const updatePayload = {
       owner,
       repo,
-      allow_merge_commit: false,
-      allow_squash_merge: false,
-      allow_rebase_merge: true,
+    };
+
+    if (needsRebaseOnlyMergeUpdate) {
+      updatePayload.allow_merge_commit = false;
+      updatePayload.allow_squash_merge = false;
+      updatePayload.allow_rebase_merge = true;
+    }
+
+    if (needsDeleteBranchUpdate) {
+      updatePayload.delete_branch_on_merge = true;
+    }
+
+    await context.octokit.repos.update({
+      ...updatePayload,
     });
 
-    context.log.info({ owner, repo }, "Set repository merge policy to rebase-only");
+    context.log.info(
+      {
+        owner,
+        repo,
+        updated: {
+          rebaseOnlyMerge: needsRebaseOnlyMergeUpdate,
+          deleteBranchOnMerge: needsDeleteBranchUpdate,
+        },
+      },
+      "Updated repository merge settings to baseline policy"
+    );
   } catch (error) {
     context.log.warn(
       {
@@ -1757,7 +1787,7 @@ async function ensureRepositoryRebaseOnlyMerge(context, owner, repo, repositoryF
         message: error?.message,
         acceptedPermissions: error?.response?.headers?.["x-accepted-github-permissions"],
       },
-      "Unable to set repository merge policy to rebase-only (requires Administration: Read and write + app reinstall/approval)"
+      "Unable to update repository merge settings baseline (requires Administration: Read and write + app reinstall/approval)"
     );
   }
 }

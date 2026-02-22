@@ -12,6 +12,8 @@ This repository is **Docker-only** for production deployment.
   - `allow_rebase_merge = true`
   - `allow_merge_commit = false`
   - `allow_squash_merge = false`
+- Enforces automatic head-branch deletion after merge:
+  - `delete_branch_on_merge = true`
 - Runs on startup (one-time backfill across installed repos), on install, when repositories are added to the app, and during normal bot webhook activity.
 - Ensures default branch has an active ruleset requiring:
   - pull requests before merge, with only `rebase` allowed in the PR rule
@@ -34,6 +36,7 @@ compliance:
 
   enforce:
     rebase_only_merge: true
+    delete_branch_on_merge: true
     default_branch_ruleset: true
     require_pull_request: true
     pull_request_allowed_merge_methods: [rebase] # merge | squash | rebase
@@ -84,6 +87,7 @@ Notes:
 - If GitHub rulesets are unavailable for a repository plan/visibility (for example private repo without GitHub Pro), bot skips ruleset enforcement for that repo and continues other compliance features.
 - Archived repositories are automatically skipped for all automation and enforcement.
 - When a repository visibility/state changes (for example private → public), bot refreshes cache and re-applies baseline requirements on repository events.
+- Linked-issue auto-close is enforced by ensuring PR bodies contain GitHub closing keywords (for example `Closes #123`) on policy-scoped branches.
 
 ### Issues
 
