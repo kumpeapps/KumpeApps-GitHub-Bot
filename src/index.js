@@ -39,6 +39,17 @@ const TYPE_KEYWORDS = {
   task: ["task", "todo", "work", "implement", "update", "refactor"],
 };
 
+const REPOSITORY_BASELINE_EVENTS = [
+  "repository.created",
+  "repository.edited",
+  "repository.publicized",
+  "repository.privatized",
+  "repository.unarchived",
+];
+const REPOSITORY_CACHE_INVALIDATION_EVENTS = new Set(
+  REPOSITORY_BASELINE_EVENTS.filter((eventName) => eventName !== "repository.created")
+);
+
 const RULESET_ENFORCEMENT_CACHE = new Set();
 const RULESET_UNSUPPORTED_CACHE = new Set();
 const RULESET_MERGE_QUEUE_UNSUPPORTED_CACHE = new Set();
@@ -433,7 +444,7 @@ module.exports = (app) => {
     }
   });
 
-  app.on(["repository.edited", "repository.publicized", "repository.privatized", "repository.unarchived"], async (context) => {
+  app.on(REPOSITORY_BASELINE_EVENTS, async (context) => {
     const repository = context.payload.repository;
     const owner = repository?.owner?.login;
     const repo = repository?.name;
@@ -443,7 +454,9 @@ module.exports = (app) => {
       return;
     }
 
-    clearRepositoryCaches(owner, repo);
+    if (REPOSITORY_CACHE_INVALIDATION_EVENTS.has(context.name)) {
+      clearRepositoryCaches(owner, repo);
+    }
 
     if (isRepositoryArchived(repository)) {
       logArchivedRepositorySkip(context.log, owner, repo, context.name);
