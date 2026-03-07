@@ -287,7 +287,7 @@ module.exports = (app) => {
     }
 
     const baseBranch = await findBaseBranch(context, owner, repo, repository.default_branch);
-    const branchName = `${slugify(issueType)}/${issue.number}`;
+    const branchName = `${slugify(issueType)}/#${issue.number}`;
 
     const branchExists = await doesBranchExist(context, owner, repo, branchName);
 
@@ -549,7 +549,7 @@ async function evaluatePullRequestComplianceCore(context, repository, pullReques
   const branchFormatPassed = !policy.pullRequest.requireBranchNaming || Boolean(parsedBranch || isDevPromotion);
   if (!branchFormatPassed) {
     failures.push(
-      `Source branch must follow \`type/issue_number\` (example: \`bug/12\`). For PRs into \`main\` or \`master\`, \`dev\` is also allowed.`
+      `Source branch must follow \`type/#issue_number\` (example: \`bug/#12\`). For PRs into \`main\` or \`master\`, \`dev\` is also allowed. Legacy format \`type/issue_number\` is also accepted.`
     );
   }
   checks.push({
@@ -559,7 +559,7 @@ async function evaluatePullRequestComplianceCore(context, repository, pullReques
       ? "Disabled by repository override."
       : branchFormatPassed
       ? `Using source branch \`${headBranch}\`.`
-      : "Expected `type/issue_number` or `dev` when targeting main/master.",
+      : "Expected `type/#issue_number` (or legacy `type/issue_number`) or `dev` when targeting main/master.",
   });
 
   if (parsedBranch) {
@@ -631,11 +631,11 @@ async function evaluatePullRequestComplianceCore(context, repository, pullReques
       detail: "Not required for `dev` promotion into `main/master`.",
     });
   } else if (policy.pullRequest.requireIssueReference || policy.pullRequest.requireIssueOpen || policy.pullRequest.requireIssueTypeMatch) {
-    failures.push("Branch does not map to `type/issue_number`, so issue requirements cannot be validated.");
+    failures.push("Branch does not map to `type/#issue_number` (or legacy `type/issue_number`), so issue requirements cannot be validated.");
     checks.push({
       name: "Referenced issue validity",
       passed: false,
-      detail: "Expected `type/issue_number` branch to validate issue requirements.",
+      detail: "Expected `type/#issue_number` (or legacy `type/issue_number`) branch to validate issue requirements.",
     });
   } else {
     checks.push({
@@ -1034,7 +1034,8 @@ function parseRecheckCommand(body) {
 }
 
 function parseTypeIssueBranch(branchName) {
-  const match = String(branchName || "").match(/^([a-z][a-z0-9-]*)\/(\d+)$/i);
+  // Support both type/#issue (new format) and type/issue (legacy format)
+  const match = String(branchName || "").match(/^([a-z][a-z0-9-]*)\/[#]?(\d+)$/i);
   if (!match) {
     return null;
   }
@@ -1275,7 +1276,7 @@ async function ensureIssueAutocloseReference(context, owner, repo, pullRequest, 
   if (!parsedBranch) {
     return {
       passed: false,
-      detail: "Cannot add issue auto-close link because branch does not map to `type/issue_number`.",
+      detail: "Cannot add issue auto-close link because branch does not map to `type/#issue_number` (or legacy `type/issue_number`).",
       failures: ["Unable to add issue auto-close link because issue number is not derivable from branch name."],
     };
   }

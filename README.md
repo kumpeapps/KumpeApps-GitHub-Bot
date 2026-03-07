@@ -101,23 +101,23 @@ On `issues.opened`:
 On `issues.assigned`:
 - Ensures issue has Type (`bug|feature|task`).
 - Creates a linked branch from `dev`, else `main`, else `master`.
-- Branch format: `type/issue_number` (example: `bug/12`).
+- Branch format: `type/#issue_number` (example: `bug/#12`). Legacy format `type/issue_number` is also supported for backwards compatibility.
 - Linked branch appears under the issue Development section (same behavior as GitHub UI "Create branch").
 
 On `create` (branch created):
-- If branch matches `type/issue_number` and the referenced issue is open, bot attempts to attach it to that issue’s Development section.
+- If branch matches `type/#issue_number` (or legacy `type/issue_number`) and the referenced issue is open, bot attempts to attach it to that issue's Development section.
 
 ### Pull requests
 
 For PRs targeting `dev`, `main`, or `master`:
-- Source branch must be `type/issue_number`.
+- Source branch must be `type/#issue_number` (example: `bug/#12`). Legacy format `type/issue_number` is also accepted.
 - Allowed type values: `bug`, `feature`, `task`.
 - Exception: PRs into `main/master` may come from `dev`.
 - Referenced issue must exist and be open.
 - Branch type must match referenced issue Type.
 - Branch must be rebased on target base branch.
 - PR must contain exactly one commit (squashed).
-- Commit message(s) must start with `[branch_name] ` (example: `[bug/12] Fix null guard`).
+- Commit message(s) must start with `[branch_name]<space>` (example: `[bug/#12] Fix null guard`). The `#` in the commit prefix creates a clickable issue link in GitHub.
 - Bot ensures PR body includes an issue-closing link (for example `Closes #123`) so merge auto-closes linked issue.
 
 Security gates:
