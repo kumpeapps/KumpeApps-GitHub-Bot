@@ -15,12 +15,39 @@ This repository is **Docker-only** for production deployment.
 - Enforces automatic head-branch deletion after merge:
   - `delete_branch_on_merge = true`
 - Runs on startup (one-time backfill across installed repos), on install, when repositories are added to the app, and during normal bot webhook activity.
-- Optionally polls GitHub App webhook delivery history and requests redelivery for failed deliveries (for downtime recovery).
 - Ensures default branch has an active ruleset requiring:
   - pull requests before merge, with only `rebase` allowed in the PR rule
   - status check `KumpeApps PR Compliance`
   - merge queue with rebase merge
   (creates one if missing).
+
+### Webhook recovery (downtime protection)
+
+The bot includes an automatic webhook recovery worker that protects against missed events during downtime or network failures.
+
+**How it works:**
+- Runs at startup and then periodically on a configurable interval
+- Scans GitHub App webhook delivery history for failed deliveries
+- Automatically requests redelivery for failed webhooks
+- Tracks retry attempts to avoid excessive redelivery
+- Stops retrying after max attempts are reached
+
+**Configuration (`.env`):**
+```bash
+WEBHOOK_RECOVERY_ENABLED=true              # Enable/disable webhook recovery
+WEBHOOK_RECOVERY_INTERVAL_MINUTES=5        # How often to check (1-1440 min)
+WEBHOOK_RECOVERY_LOOKBACK_HOURS=24         # How far back to scan (1-168 hours)
+WEBHOOK_RECOVERY_MAX_ATTEMPTS=3            # Max redelivery attempts per webhook (1-10)
+```
+
+**Default behavior:**
+- Enabled by default
+- Checks every 5 minutes
+- Scans last 24 hours of webhook deliveries
+- Retries failed deliveries up to 3 times
+- Automatically disables if GitHub App lacks webhook delivery API access
+
+**Logs:** Look for `Webhook delivery recovery sweep completed` in logs to see metrics about failed deliveries found and redelivered.
 
 ### Repository-level overrides (`.yml`)
 
