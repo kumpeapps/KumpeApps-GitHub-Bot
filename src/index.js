@@ -3362,13 +3362,18 @@ async function runWebhookRecoverySweep(app) {
 
 async function listWebhookDeliveriesWithinLookback(appOctokit, cutoffMs) {
   const deliveries = [];
-  let page = 1;
+  let cursor = null;
 
   while (true) {
-    const response = await appOctokit.request("GET /app/hook/deliveries", {
+    const requestParams = {
       per_page: 100,
-      page,
-    });
+    };
+
+    if (cursor) {
+      requestParams.cursor = cursor;
+    }
+
+    const response = await appOctokit.request("GET /app/hook/deliveries", requestParams);
 
     const pageDeliveries = Array.isArray(response?.data) ? response.data : [];
     if (pageDeliveries.length === 0) {
@@ -3384,14 +3389,33 @@ async function listWebhookDeliveriesWithinLookback(appOctokit, cutoffMs) {
     const oldestDelivery = pageDeliveries[pageDeliveries.length - 1];
     const reachedCutoff = !isDeliveryWithinLookback(oldestDelivery, cutoffMs);
 
-    if (pageDeliveries.length < 100 || reachedCutoff) {
+    if (reachedCutoff) {
       break;
     }
 
-    page += 1;
+    // Check for cursor-based pagination in Link header
+    const linkHeader = response?.headers?.link;
+    const nextCursor = extractNextCursor(linkHeader);
+    
+    if (!nextCursor) {
+      break;
+    }
+
+    cursor = nextCursor;
   }
 
   return deliveries;
+}
+
+function extractNextCursor(linkHeader) {
+  if (!linkHeader) {
+    return null;
+  }
+
+  // Parse Link header for cursor-based pagination
+  // Example: <https://api.github.com/app/hook/deliveries?cursor=xyz&per_page=100>; rel="next"
+  const match = String(linkHeader).match(/<[^>]*[?&]cursor=([^&>]+)[^>]*>;\s*rel="next"/);
+  return match ? decodeURIComponent(match[1]) : null;
 }
 
 function pruneWebhookRecoveryAttemptCache(lookbackMs) {
