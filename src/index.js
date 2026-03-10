@@ -3434,17 +3434,43 @@ function isDeliveryWithinLookback(delivery, cutoffMs) {
 }
 
 function isFailedWebhookDelivery(delivery) {
-  const status = String(delivery?.status || "").trim().toUpperCase();
-  if (status === "OK") {
-    return false;
-  }
-
+  const status = String(delivery?.status || "").trim().toLowerCase();
   const statusCode = Number(delivery?.status_code);
-  if (Number.isInteger(statusCode) && statusCode >= 200 && statusCode < 300) {
+  const hasValidStatusCode = Number.isInteger(statusCode) && statusCode > 0;
+
+  // Explicitly check for success states first
+  if (status === "ok") {
     return false;
   }
 
-  return true;
+  if (hasValidStatusCode && statusCode >= 200 && statusCode < 300) {
+    return false;
+  }
+
+  // If we have neither status nor valid statusCode, skip it (likely pending/invalid)
+  if (!status && !hasValidStatusCode) {
+    return false;
+  }
+
+  // Check for explicit failure indicators
+  // Failed status string
+  if (status === "failed" || status === "invalid" || status === "error") {
+    return true;
+  }
+
+  // Failed HTTP status code (4xx, 5xx, or 1xx which shouldn't happen)
+  if (hasValidStatusCode && (statusCode >= 400 || statusCode < 200)) {
+    return true;
+  }
+
+  // If status is present but not "ok" and no valid status code, treat as failed
+  // This catches other failure status strings
+  if (status && !hasValidStatusCode) {
+    return true;
+  }
+
+  return false;
+}
 }
 
 async function backfillRebaseOnlyMergePolicy(app) {
