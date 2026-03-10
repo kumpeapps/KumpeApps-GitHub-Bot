@@ -3297,16 +3297,52 @@ async function runWebhookRecoverySweep(app) {
 
       if (cachedAttempt.attempts >= config.maxAttempts) {
         metrics.maxAttemptsReached += 1;
+        app.log.debug(
+          {
+            deliveryId,
+            event: delivery?.event,
+            status: delivery?.status,
+            statusCode: delivery?.status_code,
+            attempts: cachedAttempt.attempts,
+          },
+          "Webhook delivery max retry attempts reached, skipping"
+        );
         continue;
       }
 
       metrics.redeliveryRequested += 1;
+
+      app.log.info(
+        {
+          deliveryId,
+          event: delivery?.event,
+          status: delivery?.status,
+          statusCode: delivery?.status_code,
+          attempt: nextAttempt,
+        },
+        "Requesting webhook redelivery"
+      );
 
       try {
         await appOctokit.request("POST /app/hook/deliveries/{delivery_id}/attempts", {
           delivery_id: deliveryId,
         });
 
+        WEBHOOK_RECOVERY_ATTEMPT_CACHE.set(deliveryId, {
+          attempts: nextAttempt,
+          updatedAt: Date.now(),
+        });
+
+        metrics.redeliverySucceeded += 1;
+        app.log.info(
+          {
+            deliveryId,
+            event: delivery?.event,
+            attempt: nextAttempt,
+          },
+          "Webhook redelivery requested successfully"
+        );
+      } catch (error) {
         WEBHOOK_RECOVERY_ATTEMPT_CACHE.set(deliveryId, {
           attempts: nextAttempt,
           updatedAt: Date.now(),
@@ -3437,6 +3473,7 @@ function isFailedWebhookDelivery(delivery) {
   const status = String(delivery?.status || "").trim().toLowerCase();
   const statusCode = Number(delivery?.status_code);
   const hasValidStatusCode = Number.isInteger(statusCode) && statusCode > 0;
+  const redelivery = delivery?.redelivery === true;
 
   // Explicitly check for success states first
   if (status === "ok") {
@@ -3447,30 +3484,50 @@ function isFailedWebhookDelivery(delivery) {
     return false;
   }
 
-  // If we have neither status nor valid statusCode, skip it (likely pending/invalid)
+  // Skip pending deliveries - they're still in progress
+  if (status === "pending") {
+    return false;
+  }
+
+  // If we have neither status nor valid statusCode, skip it (likely invalid/incomplete data)
   if (!status && !hasValidStatusCode) {
     return false;
   }
 
   // Check for explicit failure indicators
-  // Failed status string
-  if (status === "failed" || status === "invalid" || status === "error") {
+  // All known failure status strings from GitHub webhook delivery API
+  const failureStatuses = [
+    "failed",           // Explicit failure
+    "invalid",          // Invalid webhook configuration
+    "error",            // General error
+    "timeout",          // Delivery timeout
+    "connection_error", // Connection failed
+    "unreachable",      // Destination unreachable
+    "invalid_url",      // Invalid webhook URL
+  ];
+
+  if (failureStatuses.includes(status)) {
     return true;
   }
 
-  // Failed HTTP status code (4xx, 5xx, or 1xx which shouldn't happen)
-  if (hasValidStatusCode && (statusCode >= 400 || statusCode < 200)) {
+  // Failed HTTP status code (4xx, 5xx)
+  // Note: 3xx redirects should be handled by GitHub, but treat as failure if present
+  if (hasValidStatusCode && (statusCode >= 300 && statusCode !== 304)) {
     return true;
   }
 
-  // If status is present but not "ok" and no valid status code, treat as failed
-  // This catches other failure status strings
-  if (status && !hasValidStatusCode) {
+  // Catch 1xx informational codes (shouldn't happen but treat as incomplete/failed)
+  if (hasValidStatusCode && statusCode < 200) {
+    return true;
+  }
+
+  // If status is present but not a known success or pending state, treat as failed
+  // This catches any new/unknown failure status strings GitHub might add
+  if (status && status !== "ok" && status !== "pending" && !hasValidStatusCode) {
     return true;
   }
 
   return false;
-}
 }
 
 async function backfillRebaseOnlyMergePolicy(app) {
