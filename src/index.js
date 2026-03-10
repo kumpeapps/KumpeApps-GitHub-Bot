@@ -3348,13 +3348,6 @@ async function runWebhookRecoverySweep(app) {
           updatedAt: Date.now(),
         });
 
-        metrics.redeliverySucceeded += 1;
-      } catch (error) {
-        WEBHOOK_RECOVERY_ATTEMPT_CACHE.set(deliveryId, {
-          attempts: nextAttempt,
-          updatedAt: Date.now(),
-        });
-
         metrics.redeliveryFailed += 1;
 
         app.log.warn(
