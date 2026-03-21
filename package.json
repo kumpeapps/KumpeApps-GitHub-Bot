@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "js-yaml": "^4.1.1",
-    "probot": "^13.0.0"
+    "probot": "^13.0.0",
+    "toml": "^3.0.0"
   }
 }

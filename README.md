@@ -127,7 +127,8 @@ On `issues.opened`:
 
 On `issues.assigned`:
 - Ensures issue has Type (`bug|feature|task`).
-- Creates a linked branch from `dev`, else `main`, else `master`.
+- Creates a linked branch from `dev`, else `main`, else `master`, for `bug` and `feature` issues.
+- `task` issues do not get an automatic branch when assigned.
 - Branch format: `type/#issue_number` (example: `bug/#12`). Legacy format `type/issue_number` is also supported for backwards compatibility.
 - Linked branch appears under the issue Development section (same behavior as GitHub UI "Create branch").
 
@@ -155,6 +156,7 @@ Security gates:
   - always blocking on `dev/main/master`
 - Local secret scanner (changed PR files):
   - regex + entropy-based detection for likely leaked tokens/keys
+  - honors `.gitleaksignore` fingerprints and `.gitleaks.toml` allowlists for paths, regexes, and stopwords
   - blocking on `dev/main/master`
 - For private repositories, Dependabot/secret-scanning API gates are skipped, but local secret scanner still runs by default.
 

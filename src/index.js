@@ -1,3 +1,4 @@
+const toml = require("toml");
 const yaml = require("js-yaml");
 
 const ALLOWED_ISSUE_TYPES = ["bug", "feature", "task"];
@@ -73,6 +74,8 @@ let WEBHOOK_RECOVERY_RUNNING = false;
 let WEBHOOK_RECOVERY_UNSUPPORTED = false;
 const LOCAL_SECRET_SCANNER_RULE_NAME = "Local secret scanner";
 const LOCAL_SECRET_SCANNER_ALLOW_MARKER = "kumpeapps:allow-secret";
+const LOCAL_SECRET_SCANNER_GITLEAKS_IGNORE_PATH = ".gitleaksignore";
+const LOCAL_SECRET_SCANNER_GITLEAKS_CONFIG_PATH = ".gitleaks.toml";
 const LOCAL_SECRET_SCAN_MAX_FILE_BYTES = 250_000;
 const LOCAL_SECRET_SCAN_MAX_FINDINGS = 50;
 const LOCAL_SECRET_SCAN_FETCH_CONCURRENCY = 4;
@@ -281,6 +284,15 @@ module.exports = (app) => {
       await context.octokit.issues.createComment(
         context.issue({
           body: `Unable to create branch because issue type is missing. Set the issue **Type** to one of ${types.map((type) => `**${toTitleCase(type)}**`).join(", ")} or reply with \`/type <${types.join("|")}>\`, then re-assign the issue.`,
+        })
+      );
+      return;
+    }
+
+    if (normalizeType(issueType) === "task") {
+      await context.octokit.issues.createComment(
+        context.issue({
+          body: "Issue type is **Task**, so no branch was created automatically. If this work needs code changes, change the issue type to **Bug** or **Feature** and re-assign the issue.",
         })
       );
       return;
@@ -2021,6 +2033,7 @@ async function runLocalSecretScannerGate(context, owner, repo, pullRequest) {
   }
 
   try {
+    const localScanConfig = await loadLocalSecretScannerConfig(context, owner, repo, headSha);
     const files = await context.octokit.paginate(context.octokit.pulls.listFiles, {
       owner,
       repo,
@@ -2036,14 +2049,14 @@ async function runLocalSecretScannerGate(context, owner, repo, pullRequest) {
       const filename = String(file?.filename || "");
       const status = normalizeType(file?.status);
 
-      if (!filename || status === "removed" || shouldSkipLocalSecretScanPath(filename)) {
+      if (!filename || status === "removed" || shouldSkipLocalSecretScanPath(filename, localScanConfig)) {
         continue;
       }
 
       const patch = String(file?.patch || "");
       if (patch) {
         scannedFiles += 1;
-        findings.push(...scanPatchForSecrets(patch, filename));
+        findings.push(...scanPatchForSecrets(patch, filename, localScanConfig));
         if (findings.length >= LOCAL_SECRET_SCAN_MAX_FINDINGS) {
           break;
         }
@@ -2069,7 +2082,7 @@ async function runLocalSecretScannerGate(context, owner, repo, pullRequest) {
         }
 
         scannedFiles += 1;
-        findings.push(...scanTextForSecrets(result.content, result.filename));
+        findings.push(...scanTextForSecrets(result.content, result.filename, localScanConfig));
         if (findings.length >= LOCAL_SECRET_SCAN_MAX_FINDINGS) {
           break;
         }
@@ -2090,6 +2103,186 @@ async function runLocalSecretScannerGate(context, owner, repo, pullRequest) {
       scannedFiles: 0,
     };
   }
+}
+
+async function loadLocalSecretScannerConfig(context, owner, repo, ref) {
+  const [gitleaksIgnoreContent, gitleaksConfigContent] = await Promise.all([
+    fetchRepositoryTextFileAtRef(context, owner, repo, LOCAL_SECRET_SCANNER_GITLEAKS_IGNORE_PATH, ref),
+    fetchRepositoryTextFileAtRef(context, owner, repo, LOCAL_SECRET_SCANNER_GITLEAKS_CONFIG_PATH, ref),
+  ]);
+
+  return {
+    ignoredFingerprints: parseGitleaksIgnore(gitleaksIgnoreContent),
+    ...parseGitleaksTomlConfig(context, gitleaksConfigContent),
+  };
+}
+
+async function fetchRepositoryTextFileAtRef(context, owner, repo, path, ref) {
+  try {
+    const response = await context.octokit.repos.getContent({
+      owner,
+      repo,
+      path,
+      ref,
+    });
+
+    const data = response?.data;
+    if (!data || Array.isArray(data) || data.type !== "file") {
+      return null;
+    }
+
+    const encoding = normalizeType(data.encoding);
+    const rawContent = String(data.content || "");
+    return encoding === "base64" ? Buffer.from(rawContent, "base64").toString("utf8") : rawContent;
+  } catch (error) {
+    if (Number(error?.status || 0) !== 404) {
+      context.log.warn({ error, owner, repo, path, ref }, "Unable to read local secret scanner configuration file");
+    }
+    return null;
+  }
+}
+
+function parseGitleaksIgnore(content) {
+  return String(content || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"))
+    .map(parseGitleaksIgnoreEntry)
+    .filter((entry) => entry.path);
+}
+
+function parseGitleaksIgnoreEntry(entry) {
+  const rawEntry = String(entry || "").trim();
+  if (!rawEntry) {
+    return { path: "", line: null };
+  }
+
+  const pathLineMatch = rawEntry.match(/^(.*?):(\d+)$/);
+  if (!pathLineMatch) {
+    return {
+      path: normalizeRepositoryPath(rawEntry),
+      line: null,
+    };
+  }
+
+  const lineNumber = Number(pathLineMatch[2]);
+  return {
+    path: normalizeRepositoryPath(pathLineMatch[1]),
+    line: Number.isInteger(lineNumber) && lineNumber > 0 ? lineNumber : null,
+  };
+}
+
+function parseGitleaksTomlConfig(context, content) {
+  const config = {
+    pathRegexes: [],
+    lineRegexes: [],
+    candidateRegexes: [],
+    stopwords: [],
+  };
+
+  if (!content) {
+    return config;
+  }
+
+  try {
+    const parsed = toml.parse(String(content));
+    const allowlists = collectGitleaksAllowlists(parsed);
+
+    for (const allowlist of allowlists) {
+      const regexTarget = normalizeType(allowlist?.regexTarget || allowlist?.regex_target || "line");
+
+      for (const pattern of normalizeStringList(allowlist?.paths || allowlist?.path || allowlist?.files)) {
+        const compiled = compileConfigRegex(pattern, LOCAL_SECRET_SCANNER_GITLEAKS_CONFIG_PATH, context);
+        if (compiled) {
+          config.pathRegexes.push(compiled);
+        }
+      }
+
+      for (const pattern of normalizeStringList(allowlist?.regexes || allowlist?.regex)) {
+        const compiled = compileConfigRegex(pattern, LOCAL_SECRET_SCANNER_GITLEAKS_CONFIG_PATH, context);
+        if (!compiled) {
+          continue;
+        }
+
+        if (["secret", "match"].includes(regexTarget)) {
+          config.candidateRegexes.push(compiled);
+        } else {
+          config.lineRegexes.push(compiled);
+        }
+      }
+
+      config.stopwords.push(...normalizeStringList(allowlist?.stopwords).map((value) => normalizeType(value)).filter(Boolean));
+    }
+  } catch (error) {
+    context.log.warn({ error }, "Unable to parse .gitleaks.toml for local secret scanner");
+  }
+
+  config.stopwords = [...new Set(config.stopwords)];
+  return config;
+}
+
+function collectGitleaksAllowlists(parsedConfig) {
+  const allowlists = [];
+
+  if (!parsedConfig || typeof parsedConfig !== "object") {
+    return allowlists;
+  }
+
+  if (parsedConfig.allowlist && typeof parsedConfig.allowlist === "object") {
+    allowlists.push(parsedConfig.allowlist);
+  }
+
+  if (Array.isArray(parsedConfig.allowlists)) {
+    allowlists.push(...parsedConfig.allowlists.filter((entry) => entry && typeof entry === "object"));
+  }
+
+  if (Array.isArray(parsedConfig.rules)) {
+    for (const rule of parsedConfig.rules) {
+      if (!rule || typeof rule !== "object") {
+        continue;
+      }
+
+      if (rule.allowlist && typeof rule.allowlist === "object") {
+        allowlists.push(rule.allowlist);
+      }
+
+      if (Array.isArray(rule.allowlists)) {
+        allowlists.push(...rule.allowlists.filter((entry) => entry && typeof entry === "object"));
+      }
+    }
+  }
+
+  return allowlists;
+}
+
+function compileConfigRegex(pattern, sourceName, context) {
+  try {
+    const rawPattern = String(pattern || "");
+    const literalMatch = rawPattern.match(/^\/(.*)\/([a-z]*)$/i);
+
+    if (literalMatch) {
+      const [, body, flags] = literalMatch;
+      return new RegExp(body, String(flags || "").replace(/[gy]/g, ""));
+    }
+
+    return new RegExp(rawPattern);
+  } catch (error) {
+    context.log.warn({ error, pattern, sourceName }, "Skipping invalid regex from local secret scanner configuration");
+    return null;
+  }
+}
+
+function normalizeStringList(value) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => String(entry || "").trim()).filter(Boolean);
+  }
+
+  if (typeof value === "string") {
+    const normalized = value.trim();
+    return normalized ? [normalized] : [];
+  }
+
+  return [];
 }
 
 async function fetchScannableFileContentForLocalScan(context, owner, repo, filename, headSha) {
@@ -2162,16 +2355,29 @@ function applyLocalSecretScannerGateResult(localScanResult, failures, ruleResult
   });
 }
 
-function shouldSkipLocalSecretScanPath(filename) {
-  const normalizedPath = normalizeType(filename);
+function shouldSkipLocalSecretScanPath(filename, localScanConfig = {}) {
+  const normalizedPath = normalizeRepositoryPath(filename);
   if (!normalizedPath) {
     return true;
   }
 
-  return LOCAL_SECRET_SCAN_PATH_IGNORES.some((pattern) => pattern.test(normalizedPath));
+  return (
+    LOCAL_SECRET_SCAN_PATH_IGNORES.some((pattern) => pattern.test(normalizedPath)) ||
+    doesPathMatchGitleaksAllowlist(filename, localScanConfig)
+  );
 }
 
-function scanTextForSecrets(content, file) {
+function doesPathMatchGitleaksAllowlist(filename, localScanConfig = {}) {
+  const normalizedPath = normalizeRepositoryPath(filename);
+  const pathRegexes = Array.isArray(localScanConfig?.pathRegexes) ? localScanConfig.pathRegexes : [];
+  if (!normalizedPath || pathRegexes.length === 0) {
+    return false;
+  }
+
+  return pathRegexes.some((pattern) => regexMatches(pattern, normalizedPath));
+}
+
+function scanTextForSecrets(content, file, localScanConfig = {}) {
   if (!content) {
     return [];
   }
@@ -2190,7 +2396,7 @@ function scanTextForSecrets(content, file) {
     for (const detector of LOCAL_SECRET_DETECTORS) {
       const matches = line.match(detector.pattern) || [];
       for (const match of matches) {
-        if (shouldIgnoreSecretCandidate(match, line)) {
+        if (shouldIgnoreSecretCandidate(match, line, file, lineNumber, localScanConfig)) {
           continue;
         }
         findings.push({ file, line: lineNumber, detector: detector.name });
@@ -2205,7 +2411,7 @@ function scanTextForSecrets(content, file) {
     );
     for (const match of genericAssignmentMatches) {
       const secretValue = String(match[2] || "");
-      if (!secretValue || shouldIgnoreSecretCandidate(secretValue, line)) {
+      if (!secretValue || shouldIgnoreSecretCandidate(secretValue, line, file, lineNumber, localScanConfig)) {
         continue;
       }
       findings.push({ file, line: lineNumber, detector: "Generic secret assignment" });
@@ -2216,7 +2422,7 @@ function scanTextForSecrets(content, file) {
 
     const entropyCandidates = line.match(LOCAL_SECRET_HIGH_ENTROPY_REGEX) || [];
     for (const candidate of entropyCandidates) {
-      if (shouldIgnoreSecretCandidate(candidate, line)) {
+      if (shouldIgnoreSecretCandidate(candidate, line, file, lineNumber, localScanConfig)) {
         continue;
       }
 
@@ -2232,7 +2438,7 @@ function scanTextForSecrets(content, file) {
   return findings;
 }
 
-function scanPatchForSecrets(patch, file) {
+function scanPatchForSecrets(patch, file, localScanConfig = {}) {
   if (!patch) {
     return [];
   }
@@ -2242,7 +2448,7 @@ function scanPatchForSecrets(patch, file) {
     return [];
   }
 
-  return scanTextForSecrets(addedLines.map((line) => line.text).join("\n"), file).map((finding) => {
+  return scanTextForSecrets(addedLines.map((line) => line.text).join("\n"), file, localScanConfig).map((finding) => {
     const addedLine = addedLines[finding.line - 1];
     if (!addedLine) {
       return finding;
@@ -2290,7 +2496,7 @@ function extractAddedLinesFromPatch(patch) {
   return addedLines;
 }
 
-function shouldIgnoreSecretCandidate(candidate, line) {
+function shouldIgnoreSecretCandidate(candidate, line, file, lineNumber, localScanConfig = {}) {
   const token = normalizeType(candidate);
   const normalizedLine = normalizeType(line);
   if (!token || !normalizedLine) {
@@ -2301,15 +2507,124 @@ function shouldIgnoreSecretCandidate(candidate, line) {
     return true;
   }
 
-  if (
-    /(example|sample|dummy|test|fake|changeme|your[_-]?|placeholder|xxxxx|abc123|lorem|notasecret|null|undefined)/.test(
-      normalizedLine
-    )
-  ) {
+  if (isLikelyCodeIdentifier(candidate, line)) {
     return true;
   }
 
-  return false;
+  if (isPlaceholderSecretCandidate(normalizedLine)) {
+    return true;
+  }
+
+  const ignoreContext = {
+    candidate,
+    file,
+    line,
+    lineNumber,
+    localScanConfig,
+    token,
+  };
+
+  return [
+    ignoreByPathAllowlist,
+    ignoreByStopwords,
+    ignoreByCandidateRegexes,
+    ignoreByLineRegexes,
+    ignoreByFingerprint,
+  ].some((check) => check(ignoreContext));
+}
+
+function isPlaceholderSecretCandidate(normalizedLine) {
+  return /(example|sample|dummy|test|fake|changeme|your[_-]?|placeholder|xxxxx|abc123|lorem|notasecret|null|undefined)/.test(
+    normalizedLine
+  );
+}
+
+function ignoreByPathAllowlist({ file, localScanConfig }) {
+  return doesPathMatchGitleaksAllowlist(file, localScanConfig);
+}
+
+function ignoreByStopwords({ token, localScanConfig }) {
+  const stopwords = Array.isArray(localScanConfig?.stopwords) ? localScanConfig.stopwords : [];
+  return stopwords.some((stopword) => stopword && token.includes(stopword));
+}
+
+function ignoreByCandidateRegexes({ candidate, localScanConfig }) {
+  const candidateRegexes = Array.isArray(localScanConfig?.candidateRegexes) ? localScanConfig.candidateRegexes : [];
+  return candidateRegexes.some((pattern) => regexMatches(pattern, candidate));
+}
+
+function ignoreByLineRegexes({ line, localScanConfig }) {
+  const lineRegexes = Array.isArray(localScanConfig?.lineRegexes) ? localScanConfig.lineRegexes : [];
+  return lineRegexes.some((pattern) => regexMatches(pattern, line));
+}
+
+function ignoreByFingerprint({ file, lineNumber, localScanConfig }) {
+  return isIgnoredByGitleaksFingerprint(file, lineNumber, localScanConfig?.ignoredFingerprints);
+}
+
+function isLikelyCodeIdentifier(candidate, line) {
+  const rawCandidate = String(candidate || "").trim();
+  const rawLine = String(line || "");
+
+  if (!rawCandidate || !rawLine) {
+    return false;
+  }
+
+  if (!/^[A-Za-z_$][A-Za-z0-9_$]{23,}$/.test(rawCandidate)) {
+    return false;
+  }
+
+  const escapedCandidate = escapeRegex(rawCandidate);
+  const identifierUsagePatterns = [
+    new RegExp(`\\bfunction\\s+${escapedCandidate}\\b`),
+    new RegExp(`\\b(const|let|var|async|await|return)\\b[^\\n]*\\b${escapedCandidate}\\b`),
+    new RegExp(`\\b${escapedCandidate}\\s*\\(`),
+  ];
+
+  return identifierUsagePatterns.some((pattern) => regexMatches(pattern, rawLine));
+}
+
+function escapeRegex(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function regexMatches(pattern, value) {
+  return pattern instanceof RegExp && typeof value === "string" && pattern.test(value);
+}
+
+function isIgnoredByGitleaksFingerprint(file, lineNumber, ignoredFingerprints) {
+  const normalizedPath = normalizeRepositoryPath(file);
+  const normalizedLine = Number(lineNumber || 0);
+  const entries = Array.isArray(ignoredFingerprints) ? ignoredFingerprints : [];
+
+  if (!normalizedPath || !normalizedLine || entries.length === 0) {
+    return false;
+  }
+
+  return entries.some((entry) => {
+    const entryPath = normalizeRepositoryPath(entry?.path);
+    if (!entryPath) {
+      return false;
+    }
+
+    if (entry.line == null) {
+      return entryPath === normalizedPath;
+    }
+
+    if (!Number.isInteger(entry.line) || entry.line <= 0) {
+      return false;
+    }
+
+    if (entryPath === normalizedPath && entry.line === normalizedLine) {
+      return true;
+    }
+
+    return false;
+  });
+}
+
+function normalizeRepositoryPath(value) {
+  return normalizeType(String(value || "").replace(/\\+/g, "/"));
 }
 
 function calculateShannonEntropy(value) {
