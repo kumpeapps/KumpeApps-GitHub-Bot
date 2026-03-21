@@ -372,6 +372,17 @@ For repositories that use this bot, we provide Copilot agent customizations to h
 **For repository owners:**
 See [`.github/templates/repository-setup/`](.github/templates/repository-setup/) for files to copy into your repository. Once added, developers using GitHub Copilot can use `@bot-config-helper` to get help fixing false positives and configuring bot policies.
 
+**Automated Deployment:**
+Create an issue titled `[feature] Add KumpeApps Agent` and the bot will automatically:
+1. Create a feature branch for the issue
+2. Add/update the agent and prompt files to `.github/agents/` and `.github/prompts/`
+3. Add a starter `.gitleaks.toml` (only if it doesn't already exist - won't overwrite your custom config)
+4. Open a pull request ready for review
+
+**Update Behavior:**
+- **Agent and prompt files** - Always updated to latest version when automation runs
+- **`.gitleaks.toml`** - Never overwritten if it exists (this is your custom configuration)
+
 **Key behaviors the agent knows:**
 - File must be named `.gitleaks.toml` (with leading dot), not `gitleaks.toml`
 - All patterns must be lowercase: `readme\.md$`, not `README\.md$`  
