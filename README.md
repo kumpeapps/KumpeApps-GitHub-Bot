@@ -124,6 +124,13 @@ On `issues.opened`:
 - If issue **Type** is missing, bot tries to infer from title/body.
 - If inferred, sets native GitHub Issue Type.
 - If not inferred, asks for `/type bug|feature|task`.
+- **Special automation**: If issue title matches `/\[feature\]\s*add\s+kumpeapps\s+agent/i`, the bot automatically:
+  1. Sets issue type to `feature`
+  2. Creates a `feature/#<issue_number>` branch
+  3. Fetches the bot-config-helper agent template from the bot repository
+  4. Commits `.github/agents/bot-config-helper.agent.md` to the branch
+  5. Creates a PR with detailed description that auto-closes the issue on merge
+  - This automation helps repository owners quickly add the Copilot agent that helps developers configure gitleaks and bot policies correctly.
 
 On `issues.assigned`:
 - Ensures issue has Type (`bug|feature|task`).
@@ -345,6 +352,28 @@ From [.env.example](.env.example):
 - `WEBHOOK_RECOVERY_INTERVAL_MINUTES` (default `5`)
 - `WEBHOOK_RECOVERY_LOOKBACK_HOURS` (default `24`)
 - `WEBHOOK_RECOVERY_MAX_ATTEMPTS` (default `3`)
+
+## GitHub Copilot agent templates
+
+For repositories that use this bot, we provide Copilot agent customizations to help developers configure gitleaks and bot policies correctly.
+
+**Why?** The bot normalizes all paths and strings to **lowercase** before matching gitleaks patterns. This catches many developers off-guard when configuring `.gitleaks.toml` files.
+
+**What's included:**
+- `bot-config-helper` agent - Understands bot normalization, file naming requirements, configuration syntax, and **commit message formatting**
+- `generate-gitleaks-config` prompt - Quick template generator for `.gitleaks.toml` files
+
+**For repository owners:**
+See [`.github/templates/repository-setup/`](.github/templates/repository-setup/) for files to copy into your repository. Once added, developers using GitHub Copilot can use `@bot-config-helper` to get help fixing false positives and configuring bot policies.
+
+**Key behaviors the agent knows:**
+- File must be named `.gitleaks.toml` (with leading dot), not `gitleaks.toml`
+- All patterns must be lowercase: `readme\.md$`, not `README\.md$`  
+- Stopwords must be lowercase: `"api_key"`, not `"API_KEY"`
+- The bot's `normalizeType()` function converts all strings to lowercase before matching
+- **Commit messages** must use `[branch_name] Message` format (e.g., `[bug/#12] Fix issue`)
+
+See the [template README](.github/templates/repository-setup/README.md) for installation instructions.
 
 ## Verify image signatures
 
