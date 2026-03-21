@@ -96,6 +96,14 @@ const AGENT_TEMPLATE_FILES = [
     source: ".github/templates/repository-setup/.github/agents/bot-config-helper.agent.md",
     dest: ".github/agents/bot-config-helper.agent.md",
   },
+  {
+    source: ".github/templates/repository-setup/.github/prompts/generate-gitleaks-config.prompt.md",
+    dest: ".github/prompts/generate-gitleaks-config.prompt.md",
+  },
+  {
+    source: ".github/templates/repository-setup/.gitleaks.toml",
+    dest: ".gitleaks.toml",
+  },
 ];
 const LOCAL_SECRET_DETECTORS = [
   {
@@ -1136,14 +1144,15 @@ async function handleAgentSetupAutomation(context, owner, repo, issue, repositor
         }
 
         // Use the base64 content directly without decode-reencode to avoid corruption
-        const base64Content = templateContent.data.content;
+        // Strip any newlines that may be present in the API response
+        const base64Content = String(templateContent.data.content || "").replace(/\s/g, "");
 
         // Create or update the file in the target repository
         await context.octokit.repos.createOrUpdateFileContents({
           owner,
           repo,
           path: fileSpec.dest,
-          message: `Add ${fileSpec.dest} from KumpeApps-GitHub-Bot templates`,
+          message: `[${branchName}] Add ${fileSpec.dest} from KumpeApps-GitHub-Bot templates`,
           content: base64Content,
           branch: branchName,
         });
@@ -1229,12 +1238,13 @@ Review and merge the PR to enable the agent in this repository.`,
 
     context.log.info({ owner, repo, issue: issue.number, pr: pr.data.number }, "Agent setup automation completed");
   } catch (error) {
-    context.log.error({ error, owner, repo, issue: issue.number }, "Agent setup automation failed");
+    const errorId = `agent-setup-${Date.now().toString(36)}`;
+    context.log.error({ error, errorId, owner, repo, issue: issue.number }, "Agent setup automation failed");
     await context.octokit.issues.createComment(
       context.issue({
-        body: `❌ Automation failed: ${error.message}
+        body: `❌ Automation failed while setting up the agent.
 
-Please check the bot logs or manually copy the agent template from:
+A detailed error has been logged with ID: \`${errorId}\`. Please check the bot logs or manually copy the agent template from:
 https://github.com/kumpeapps/KumpeApps-GitHub-Bot/tree/main/.github/templates/repository-setup`,
       })
     );
@@ -2605,11 +2615,18 @@ function scanTextForSecrets(content, file, localScanConfig = {}) {
 
     const entropyCandidates = line.match(LOCAL_SECRET_HIGH_ENTROPY_REGEX) || [];
     for (const candidate of entropyCandidates) {
+      // Enforce minimum length for entropy candidates
+      if (candidate.length < LOCAL_SECRET_HIGH_ENTROPY_MIN_LENGTH) {
+        continue;
+      }
+
       if (shouldIgnoreSecretCandidate(candidate, line, file, lineNumber, localScanConfig)) {
         continue;
       }
 
-      if (calculateShannonEntropy(candidate) >= 4.0) {
+      // Use higher threshold (4.5) to reduce false positives while still catching real secrets
+      // Most real secrets (API keys, tokens) have entropy > 4.5
+      if (calculateShannonEntropy(candidate) >= 4.5) {
         findings.push({ file, line: lineNumber, detector: "High entropy token" });
         if (findings.length >= LOCAL_SECRET_SCAN_MAX_FINDINGS) {
           return findings;
@@ -2698,6 +2715,14 @@ function shouldIgnoreSecretCandidate(candidate, line, file, lineNumber, localSca
     return true;
   }
 
+  if (isMarkdownOrDocumentationContent(line, file)) {
+    return true;
+  }
+
+  if (looksLikeFilePath(candidate)) {
+    return true;
+  }
+
   const ignoreContext = {
     candidate,
     file,
@@ -2765,6 +2790,81 @@ function isLikelyCodeIdentifier(candidate, line) {
   ];
 
   return identifierUsagePatterns.some((pattern) => regexMatches(pattern, rawLine));
+}
+
+function isMarkdownOrDocumentationContent(line, file) {
+  const rawLine = String(line || "").trim();
+  if (!rawLine) {
+    return false;
+  }
+
+  // Only apply markdown filtering to actual documentation files
+  const isDocFile = /\.(md|markdown|rst|txt|agent|prompt|instructions)$/i.test(file || "");
+  if (!isDocFile) {
+    return false;
+  }
+
+  // Require multiple markdown indicators on the same line to reduce false positives
+  // Single indicators are too common and could hide real secrets
+  const indicators = [];
+  
+  // Markdown table row (must have at least 2 pipes)
+  if (/\|.*\|/.test(rawLine)) {
+    indicators.push('table');
+  }
+  
+  // Markdown code fence
+  if (/^```/.test(rawLine) || /^~~~/.test(rawLine)) {
+    indicators.push('fence');
+  }
+  
+  // Markdown header
+  if (/^#{1,6}\s/.test(rawLine)) {
+    indicators.push('header');
+  }
+  
+  // URL that's clearly a documentation example (has 'example' or is in a markdown link)
+  if (/https?:\/\/.*example|\[.*\]\(https?:\/\//.test(rawLine)) {
+    indicators.push('example-url');
+  }
+
+  // Only exclude if we have clear documentation context (multiple indicators or specific patterns)
+  // This is more conservative than excluding any line with a single markdown character
+  return indicators.length >= 1 && (indicators.includes('header') || indicators.includes('table'));
+}
+
+function looksLikeFilePath(candidate) {
+  const rawCandidate = String(candidate || "").trim();
+  if (!rawCandidate) {
+    return false;
+  }
+
+  // Require stronger evidence of file path structure to avoid false negatives
+  // Many real secrets (base64, tokens) should not be skipped just because they contain a slash
+  
+  // Unix/Windows absolute paths (starting with / or drive letter)
+  if (/^(\/|[A-Za-z]:\\)/.test(rawCandidate)) {
+    return true;
+  }
+  
+  // Relative path with multiple segments (./path/to/file or ../path)
+  if (/^\.\.?\/[^\/]+\//.test(rawCandidate)) {
+    return true;
+  }
+  
+  // Path with file extension at the end (more likely to be a real path)
+  if (/[\/\\][^\/\\]+\.(md|toml|yml|yaml|json|txt|sh|js|ts|py|rb|go|java|xml|html|css|agent|prompt|instructions)$/i.test(rawCandidate)) {
+    return true;
+  }
+  
+  // Environment variable assignment pattern at start of candidate (not just anywhere)
+  if (/^[A-Z_][A-Z0-9_]*=/.test(rawCandidate)) {
+    return true;
+  }
+
+  // Do NOT treat any string with a single slash as a path - this is too broad
+  // and will miss many real secrets (some tokens, keys, etc. may contain slashes)
+  return false;
 }
 
 function escapeRegex(value) {

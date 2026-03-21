@@ -16,7 +16,7 @@ curl -sL https://raw.githubusercontent.com/kumpeapps/KumpeApps-GitHub-Bot/main/.
   -o .github/agents/bot-config-helper.agent.md
 
 mkdir -p .github/prompts
-curl -sL https://raw.githubusercontent.com/kumpeapps/KumpeApps-GitHub-Bot/main/.github/templates/repository-setup/.github/generate-gitleaks-config.prompt.md \
+curl -sL https://raw.githubusercontent.com/kumpeapps/KumpeApps-GitHub-Bot/main/.github/templates/repository-setup/.github/prompts/generate-gitleaks-config.prompt.md \
   -o .github/prompts/generate-gitleaks-config.prompt.md
 ```
 
