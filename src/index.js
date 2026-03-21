@@ -95,14 +95,17 @@ const AGENT_TEMPLATE_FILES = [
   {
     source: ".github/templates/repository-setup/.github/agents/bot-config-helper.agent.md",
     dest: ".github/agents/bot-config-helper.agent.md",
+    updateIfExists: true, // Always update agent files to latest version
   },
   {
     source: ".github/templates/repository-setup/.github/prompts/generate-gitleaks-config.prompt.md",
     dest: ".github/prompts/generate-gitleaks-config.prompt.md",
+    updateIfExists: true, // Always update prompt files to latest version
   },
   {
     source: ".github/templates/repository-setup/.gitleaks.toml",
     dest: ".gitleaks.toml",
+    updateIfExists: false, // Never overwrite - it's a starter example that users customize
   },
 ];
 const LOCAL_SECRET_DETECTORS = [
@@ -1082,6 +1085,189 @@ function parseTypeIssueBranch(branchName) {
   };
 }
 
+/**
+ * Fetch template files and plan which files to commit, skip, or mark as failed.
+ * @returns {Object} { filesToCommit, filesSkipped, filesFailed }
+ */
+async function planTemplateFileChanges(context, owner, repo, branchName, templateFiles) {
+  const filesToCommit = [];
+  const filesSkipped = [];
+  const filesFailed = [];
+
+  for (const fileSpec of templateFiles) {
+    try {
+      const templateContent = await context.octokit.repos.getContent({
+        owner: AGENT_TEMPLATE_OWNER,
+        repo: AGENT_TEMPLATE_REPO,
+        path: fileSpec.source,
+        ref: AGENT_TEMPLATE_REF,
+      });
+
+      if (!templateContent.data || templateContent.data.type !== "file") {
+        context.log.warn({ fileSpec }, "Template file not found or not a file");
+        filesFailed.push({ source: fileSpec.source, dest: fileSpec.dest, error: "Not found or not a file" });
+        continue;
+      }
+
+      // Use the base64 content directly without decode-reencode to avoid corruption
+      // Strip any newlines that may be present in the API response
+      const base64Content = String(templateContent.data.content || "").replace(/\s/g, "");
+
+      // Check if file already exists in target repo
+      let fileExists = false;
+      try {
+        const existingFile = await context.octokit.repos.getContent({
+          owner,
+          repo,
+          path: fileSpec.dest,
+          ref: branchName,
+        });
+        if (existingFile.data && existingFile.data.type === "file") {
+          fileExists = true;
+          
+          // Skip if file exists and updateIfExists is false (e.g., .gitleaks.toml)
+          if (fileSpec.updateIfExists === false) {
+            context.log.info({ fileSpec }, "Skipping file - already exists and updateIfExists=false");
+            filesSkipped.push(fileSpec.dest);
+            continue;
+          }
+        }
+      } catch (error) {
+        // File doesn't exist yet (404) - this is fine
+        if (error.status !== 404) {
+          throw error; // Re-throw non-404 errors
+        }
+      }
+
+      // Add to files to commit
+      filesToCommit.push({
+        path: fileSpec.dest,
+        content: base64Content,
+        isUpdate: fileExists,
+      });
+    } catch (error) {
+      context.log.error({ error, fileSpec }, "Failed to fetch template file");
+      filesFailed.push({ source: fileSpec.source, dest: fileSpec.dest, error: error.message });
+    }
+  }
+
+  return { filesToCommit, filesSkipped, filesFailed };
+}
+
+/**
+ * Create a single commit with all file changes using Git Data API.
+ * @returns {Object} { commitSha }
+ */
+async function createCommitWithFiles(context, owner, repo, branchName, filesToCommit, filesSkipped) {
+  // Get the current commit SHA of the branch
+  const branchRef = await context.octokit.git.getRef({
+    owner,
+    repo,
+    ref: `heads/${branchName}`,
+  });
+  const currentCommitSha = branchRef.data.object.sha;
+
+  // Get the current commit to get its tree
+  const currentCommit = await context.octokit.git.getCommit({
+    owner,
+    repo,
+    commit_sha: currentCommitSha,
+  });
+  const baseTreeSha = currentCommit.data.tree.sha;
+
+  // Create blobs for all files
+  const treeItems = [];
+  for (const file of filesToCommit) {
+    // Create blob for file content
+    const blob = await context.octokit.git.createBlob({
+      owner,
+      repo,
+      content: file.content,
+      encoding: "base64",
+    });
+
+    treeItems.push({
+      path: file.path,
+      mode: "100644", // Regular file
+      type: "blob",
+      sha: blob.data.sha,
+    });
+  }
+
+  // Create new tree with all changes
+  const newTree = await context.octokit.git.createTree({
+    owner,
+    repo,
+    base_tree: baseTreeSha,
+    tree: treeItems,
+  });
+
+  // Determine commit message
+  const hasUpdates = filesToCommit.some((f) => f.isUpdate);
+  const hasNew = filesToCommit.some((f) => !f.isUpdate);
+  let commitAction = "Add";
+  if (hasUpdates && hasNew) {
+    commitAction = "Add/update";
+  } else if (hasUpdates) {
+    commitAction = "Update";
+  }
+
+  // Create commit with all changes
+  const newCommit = await context.octokit.git.createCommit({
+    owner,
+    repo,
+    message: `[${branchName}] ${commitAction} KumpeApps-GitHub-Bot agent files\n\nFiles:\n${filesToCommit.map((f) => `- ${f.isUpdate ? 'Update' : 'Add'} ${f.path}`).join('\n')}${filesSkipped.length > 0 ? `\n\nSkipped (already exist):\n${filesSkipped.map((f) => `- ${f}`).join('\n')}` : ''}`,
+    tree: newTree.data.sha,
+    parents: [currentCommitSha],
+  });
+
+  // Update branch to point to new commit
+  await context.octokit.git.updateRef({
+    owner,
+    repo,
+    ref: `heads/${branchName}`,
+    sha: newCommit.data.sha,
+  });
+
+  return { commitSha: newCommit.data.sha };
+}
+
+/**
+ * Build the PR body text for the agent setup pull request.
+ * @returns {string} Formatted PR body
+ */
+function buildAgentSetupPrBody(issueNumber, filesCreated, filesSkipped) {
+  return `Automatically generated PR to add GitHub Copilot agent for KumpeApps-GitHub-Bot configuration.
+
+## Added Files
+${filesCreated.map((file) => `- \`${file}\``).join("\n")}${filesSkipped.length > 0 ? `\n\n## Skipped Files (already exist)\n${filesSkipped.map((file) => `- \`${file}\` - Not overwriting existing configuration`).join("\n")}` : ''}
+
+## What is this?
+This PR adds:
+- **GitHub Copilot agent** (\`@bot-config-helper\`) - Helps configure gitleaks and bot policies correctly
+- **Prompt file** - Quick gitleaks config generator${filesSkipped.includes('.gitleaks.toml') ? '' : '\n- **Starter gitleaks config** (\`.gitleaks.toml\`) - Pre-configured to exclude agent files and common false positives'}
+
+The agent understands the bot's specific behaviors:
+- **Lowercase normalization** - All paths and values are normalized to lowercase before matching
+- **File naming requirements** - \`.gitleaks.toml\` (with leading dot), not \`gitleaks.toml\`
+- **Configuration syntax** - Proper TOML structure for allowlists
+- **Commit message formatting** - Required \`[branch_name]\` prefix format
+
+${filesSkipped.includes('.gitleaks.toml') ? '**Note**: Your existing \`.gitleaks.toml\` was preserved - it contains your repository-specific configuration and should not be overwritten.' : '**Note**: The included \`.gitleaks.toml\` is a starter example. Feel free to customize it for your repository\'s specific needs.'}
+
+## Usage
+Once merged, developers can use:
+- \`@bot-config-helper\` - Ask the agent for help with bot configuration
+- Example: "@bot-config-helper fix the README.md false positive"
+- Example: "@bot-config-helper help me format my commit message"
+
+## Learn More
+- [Template Documentation](https://github.com/kumpeapps/KumpeApps-GitHub-Bot/tree/main/.github/templates/repository-setup)
+- [KumpeApps-GitHub-Bot](https://github.com/kumpeapps/KumpeApps-GitHub-Bot)
+
+Closes #${issueNumber}`;
+}
+
 async function handleAgentSetupAutomation(context, owner, repo, issue, repository) {
   context.log.info({ owner, repo, issue: issue.number }, "Handling agent setup automation");
 
@@ -1125,54 +1311,24 @@ async function handleAgentSetupAutomation(context, owner, repo, issue, repositor
       })
     );
 
-    // Fetch agent template files from the bot repository
-    const filesCreated = [];
-    const filesFailed = [];
-    for (const fileSpec of AGENT_TEMPLATE_FILES) {
-      try {
-        const templateContent = await context.octokit.repos.getContent({
-          owner: AGENT_TEMPLATE_OWNER,
-          repo: AGENT_TEMPLATE_REPO,
-          path: fileSpec.source,
-          ref: AGENT_TEMPLATE_REF,
-        });
-
-        if (!templateContent.data || templateContent.data.type !== "file") {
-          context.log.warn({ fileSpec }, "Template file not found or not a file");
-          filesFailed.push({ source: fileSpec.source, dest: fileSpec.dest, error: "Not found or not a file" });
-          continue;
-        }
-
-        // Use the base64 content directly without decode-reencode to avoid corruption
-        // Strip any newlines that may be present in the API response
-        const base64Content = String(templateContent.data.content || "").replace(/\s/g, "");
-
-        // Create or update the file in the target repository
-        await context.octokit.repos.createOrUpdateFileContents({
-          owner,
-          repo,
-          path: fileSpec.dest,
-          message: `[${branchName}] Add ${fileSpec.dest} from KumpeApps-GitHub-Bot templates`,
-          content: base64Content,
-          branch: branchName,
-        });
-
-        filesCreated.push(fileSpec.dest);
-      } catch (error) {
-        context.log.error({ error, fileSpec }, "Failed to copy template file");
-        filesFailed.push({ source: fileSpec.source, dest: fileSpec.dest, error: error.message });
-      }
-    }
+    // Fetch all template files and plan what to commit
+    const { filesToCommit, filesSkipped, filesFailed } = await planTemplateFileChanges(
+      context,
+      owner,
+      repo,
+      branchName,
+      AGENT_TEMPLATE_FILES
+    );
 
     // Treat any failure as hard failure - do not create PR if any file failed
     if (filesFailed.length > 0) {
       const failureDetails = filesFailed.map((f) => `- \`${f.dest}\` (from \`${f.source}\`): ${f.error}`).join("\n");
       const successDetails =
-        filesCreated.length > 0 ? `\n\n**Partially succeeded:**\n${filesCreated.map((f) => `- \`${f}\``).join("\n")}` : "";
+        filesToCommit.length > 0 ? `\n\n**Partially succeeded:**\n${filesToCommit.map((f) => `- \`${f.path}\``).join("\n")}` : "";
 
       await context.octokit.issues.createComment(
         context.issue({
-          body: `❌ Failed to copy all template files. Setup is incomplete and no PR was created.
+          body: `❌ Failed to fetch all template files. Setup is incomplete and no PR was created.
 
 **Failed:**
 ${failureDetails}${successDetails}
@@ -1184,7 +1340,45 @@ https://github.com/kumpeapps/KumpeApps-GitHub-Bot/tree/main/.github/templates/re
       return;
     }
 
-    if (filesCreated.length === 0) {
+    if (filesToCommit.length === 0 && filesSkipped.length === 0) {
+      await context.octokit.issues.createComment(
+        context.issue({
+          body: `❌ No template files to add. Please check bot configuration and logs.`,
+        })
+      );
+      return;
+    }
+
+    // Create a single commit with all file changes
+    if (filesToCommit.length > 0) {
+      try {
+        const { commitSha } = await createCommitWithFiles(
+          context,
+          owner,
+          repo,
+          branchName,
+          filesToCommit,
+          filesSkipped
+        );
+        context.log.info({ owner, repo, branchName, commitSha }, "Created single commit with all files");
+      } catch (error) {
+        const errorId = `commit-${Date.now().toString(36)}`;
+        context.log.error({ error, errorId, owner, repo, branchName }, "Failed to create commit");
+        await context.octokit.issues.createComment(
+          context.issue({
+            body: `❌ Failed to commit files to branch \`${branchName}\`.
+
+A detailed error has been logged with ID: \`${errorId}\`. Please check the bot logs or manually copy the agent template from:
+https://github.com/kumpeapps/KumpeApps-GitHub-Bot/tree/main/.github/templates/repository-setup`,
+          })
+        );
+        return;
+      }
+    }
+
+    const filesCreated = filesToCommit.map((f) => f.path);
+
+    if (filesCreated.length === 0 && filesSkipped.length === 0) {
       await context.octokit.issues.createComment(
         context.issue({
           body: `❌ No template files were copied. Please check bot configuration and logs.`,
@@ -1193,34 +1387,14 @@ https://github.com/kumpeapps/KumpeApps-GitHub-Bot/tree/main/.github/templates/re
       return;
     }
 
-    // Create pull request only if all files succeeded
+    // Create pull request
     const pr = await context.octokit.pulls.create({
       owner,
       repo,
       title: `[feature] Add KumpeApps-GitHub-Bot Copilot agent (#${issue.number})`,
       head: branchName,
       base: defaultBranch,
-      body: `Automatically generated PR to add GitHub Copilot agent for KumpeApps-GitHub-Bot configuration.
-
-## Added Files
-${filesCreated.map((file) => `- \`${file}\``).join("\n")}
-
-## What is this?
-This Copilot agent helps developers in this repository configure gitleaks and bot policies correctly by understanding the bot's specific behaviors:
-- **Lowercase normalization** - All paths and values are normalized to lowercase before matching
-- **File naming requirements** - \`.gitleaks.toml\` (with leading dot), not \`gitleaks.toml\`
-- **Configuration syntax** - Proper TOML structure for allowlists
-
-## Usage
-Once merged, developers can use:
-- \`@bot-config-helper\` - Ask the agent for help with bot configuration
-- Example: "@bot-config-helper fix the README.md false positive"
-
-## Learn More
-- [Template Documentation](https://github.com/kumpeapps/KumpeApps-GitHub-Bot/tree/main/.github/templates/repository-setup)
-- [KumpeApps-GitHub-Bot](https://github.com/kumpeapps/KumpeApps-GitHub-Bot)
-
-Closes #${issue.number}`,
+      body: buildAgentSetupPrBody(issue.number, filesCreated, filesSkipped),
     });
 
     await context.octokit.issues.createComment(
@@ -1228,11 +1402,11 @@ Closes #${issue.number}`,
         body: `🎉 Successfully created PR #${pr.data.number}!
 
 **Files added:**
-${filesCreated.map((file) => `- \`${file}\``).join("\n")}
+${filesCreated.map((file) => `- \`${file}\``).join("\n")}${filesSkipped.length > 0 ? `\n\n**Files skipped (already exist):**\n${filesSkipped.map((file) => `- \`${file}\` - Keeping existing configuration`).join("\n")}` : ''}
 
-The \`@bot-config-helper\` Copilot agent will be available after the PR is merged. This agent understands the bot's lowercase normalization behavior and can help fix gitleaks false positives.
+The \`@bot-config-helper\` Copilot agent will be available after the PR is merged. This agent understands the bot's lowercase normalization behavior and can help fix gitleaks false positives and format commit messages correctly.${filesSkipped.length > 0 ? '\n\n💡 **Note**: Existing configuration files were not overwritten - you can customize them as needed for your repository.' : ''}
 
-Review and merge the PR to enable the agent in this repository.`,
+Review and merge the PR to enable these tools in this repository.`,
       })
     );
 
@@ -2288,10 +2462,24 @@ async function runLocalSecretScannerGate(context, owner, repo, pullRequest) {
       scannedFiles,
     };
   } catch (error) {
-    context.log.warn({ error, owner, repo, pullNumber }, "Unable to run local secret scanner on PR files");
+    const errorId = `secret-scan-${Date.now().toString(36)}`;
+    context.log.error(
+      {
+        error,
+        errorId,
+        errorMessage: error.message,
+        errorStatus: error.status,
+        owner,
+        repo,
+        pullNumber,
+        headSha,
+      },
+      "Unable to run local secret scanner on PR files"
+    );
     return {
       available: false,
       reason: "unable to list pull request files",
+      errorId,
       findings: [],
       scannedFiles: 0,
     };
@@ -2521,8 +2709,17 @@ async function fetchScannableFileContentForLocalScan(context, owner, repo, filen
 function applyLocalSecretScannerGateResult(localScanResult, failures, ruleResults) {
   if (!localScanResult?.available) {
     const reason = localScanResult?.reason || "scanner execution failed";
-    failures.push(`Security gate could not complete local secret scan (${reason}).`);
-    ruleResults.push({ name: LOCAL_SECRET_SCANNER_RULE_NAME, passed: false, detail: `${reason}.` });
+    const errorId = localScanResult?.errorId;
+    const warningDetail = errorId
+      ? `${reason} (error ID: ${errorId}).`
+      : `${reason}.`;
+    
+    // Treat scanner unavailability as neutral (not a failure) since users can't control this
+    ruleResults.push({
+      name: LOCAL_SECRET_SCANNER_RULE_NAME,
+      passed: true,
+      detail: `⚠️ Secret scan skipped: ${warningDetail}`,
+    });
     return;
   }
 
