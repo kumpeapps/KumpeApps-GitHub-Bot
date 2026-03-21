@@ -87,6 +87,16 @@ const LOCAL_SECRET_SCAN_PATH_IGNORES = [
 const LOCAL_SECRET_GENERIC_ASSIGNMENT_REGEX =
   /\b(api[_-]?key|secret|token|password|passwd|client[_-]?secret|private[_-]?key)\b\s*[:=]\s*["']?([A-Za-z0-9_\-\/=+]{10,})["']?/gi;
 const LOCAL_SECRET_HIGH_ENTROPY_REGEX = /[A-Za-z0-9+/=]{24,}/g;
+const AGENT_SETUP_ISSUE_PATTERN = /\[feature\]\s*add\s+kumpeapps\s+agent/i;
+const AGENT_TEMPLATE_OWNER = "kumpeapps";
+const AGENT_TEMPLATE_REPO = "KumpeApps-GitHub-Bot";
+const AGENT_TEMPLATE_REF = "main";
+const AGENT_TEMPLATE_FILES = [
+  {
+    source: ".github/templates/repository-setup/.github/agents/bot-config-helper.agent.md",
+    dest: ".github/agents/bot-config-helper.agent.md",
+  },
+];
 const LOCAL_SECRET_DETECTORS = [
   {
     name: "GitHub token",
@@ -172,6 +182,12 @@ module.exports = (app) => {
     const types = policy.issueTypes;
 
     await ensureRepositoryBaselineCompliance(context, owner, repo, repository);
+
+    // Check for agent setup automation request
+    if (AGENT_SETUP_ISSUE_PATTERN.test(issue.title)) {
+      await handleAgentSetupAutomation(context, owner, repo, issue, repository);
+      return;
+    }
 
     const existingType = await getIssueTypeName(context, owner, repo, issue, types);
     if (existingType) {
@@ -1056,6 +1072,173 @@ function parseTypeIssueBranch(branchName) {
     type: normalizeType(match[1]),
     issueNumber: Number(match[2]),
   };
+}
+
+async function handleAgentSetupAutomation(context, owner, repo, issue, repository) {
+  context.log.info({ owner, repo, issue: issue.number }, "Handling agent setup automation");
+
+  try {
+    // Set issue type to feature
+    await setIssueTypeByName(context, owner, repo, issue.node_id, "feature");
+
+    // Create branch
+    const branchName = `feature/#${issue.number}`;
+    const defaultBranch = repository.default_branch;
+
+    // Check if branch already exists
+    const branchExists = await doesBranchExist(context, owner, repo, branchName);
+    if (branchExists) {
+      await context.octokit.issues.createComment(
+        context.issue({
+          body: `⚠️ Branch \`${branchName}\` already exists. Please delete it first or close this issue.`,
+        })
+      );
+      return;
+    }
+
+    // Get default branch ref
+    const baseRef = await context.octokit.git.getRef({
+      owner,
+      repo,
+      ref: `heads/${defaultBranch}`,
+    });
+
+    // Create new branch
+    await context.octokit.git.createRef({
+      owner,
+      repo,
+      ref: `refs/heads/${branchName}`,
+      sha: baseRef.data.object.sha,
+    });
+
+    await context.octokit.issues.createComment(
+      context.issue({
+        body: `✅ Created branch \`${branchName}\`. Now fetching agent template files...`,
+      })
+    );
+
+    // Fetch agent template files from the bot repository
+    const filesCreated = [];
+    const filesFailed = [];
+    for (const fileSpec of AGENT_TEMPLATE_FILES) {
+      try {
+        const templateContent = await context.octokit.repos.getContent({
+          owner: AGENT_TEMPLATE_OWNER,
+          repo: AGENT_TEMPLATE_REPO,
+          path: fileSpec.source,
+          ref: AGENT_TEMPLATE_REF,
+        });
+
+        if (!templateContent.data || templateContent.data.type !== "file") {
+          context.log.warn({ fileSpec }, "Template file not found or not a file");
+          filesFailed.push({ source: fileSpec.source, dest: fileSpec.dest, error: "Not found or not a file" });
+          continue;
+        }
+
+        // Use the base64 content directly without decode-reencode to avoid corruption
+        const base64Content = templateContent.data.content;
+
+        // Create or update the file in the target repository
+        await context.octokit.repos.createOrUpdateFileContents({
+          owner,
+          repo,
+          path: fileSpec.dest,
+          message: `Add ${fileSpec.dest} from KumpeApps-GitHub-Bot templates`,
+          content: base64Content,
+          branch: branchName,
+        });
+
+        filesCreated.push(fileSpec.dest);
+      } catch (error) {
+        context.log.error({ error, fileSpec }, "Failed to copy template file");
+        filesFailed.push({ source: fileSpec.source, dest: fileSpec.dest, error: error.message });
+      }
+    }
+
+    // Treat any failure as hard failure - do not create PR if any file failed
+    if (filesFailed.length > 0) {
+      const failureDetails = filesFailed.map((f) => `- \`${f.dest}\` (from \`${f.source}\`): ${f.error}`).join("\n");
+      const successDetails =
+        filesCreated.length > 0 ? `\n\n**Partially succeeded:**\n${filesCreated.map((f) => `- \`${f}\``).join("\n")}` : "";
+
+      await context.octokit.issues.createComment(
+        context.issue({
+          body: `❌ Failed to copy all template files. Setup is incomplete and no PR was created.
+
+**Failed:**
+${failureDetails}${successDetails}
+
+Please check the bot logs or manually copy the agent template from:
+https://github.com/kumpeapps/KumpeApps-GitHub-Bot/tree/main/.github/templates/repository-setup`,
+        })
+      );
+      return;
+    }
+
+    if (filesCreated.length === 0) {
+      await context.octokit.issues.createComment(
+        context.issue({
+          body: `❌ No template files were copied. Please check bot configuration and logs.`,
+        })
+      );
+      return;
+    }
+
+    // Create pull request only if all files succeeded
+    const pr = await context.octokit.pulls.create({
+      owner,
+      repo,
+      title: `[feature] Add KumpeApps-GitHub-Bot Copilot agent (#${issue.number})`,
+      head: branchName,
+      base: defaultBranch,
+      body: `Automatically generated PR to add GitHub Copilot agent for KumpeApps-GitHub-Bot configuration.
+
+## Added Files
+${filesCreated.map((file) => `- \`${file}\``).join("\n")}
+
+## What is this?
+This Copilot agent helps developers in this repository configure gitleaks and bot policies correctly by understanding the bot's specific behaviors:
+- **Lowercase normalization** - All paths and values are normalized to lowercase before matching
+- **File naming requirements** - \`.gitleaks.toml\` (with leading dot), not \`gitleaks.toml\`
+- **Configuration syntax** - Proper TOML structure for allowlists
+
+## Usage
+Once merged, developers can use:
+- \`@bot-config-helper\` - Ask the agent for help with bot configuration
+- Example: "@bot-config-helper fix the README.md false positive"
+
+## Learn More
+- [Template Documentation](https://github.com/kumpeapps/KumpeApps-GitHub-Bot/tree/main/.github/templates/repository-setup)
+- [KumpeApps-GitHub-Bot](https://github.com/kumpeapps/KumpeApps-GitHub-Bot)
+
+Closes #${issue.number}`,
+    });
+
+    await context.octokit.issues.createComment(
+      context.issue({
+        body: `🎉 Successfully created PR #${pr.data.number}!
+
+**Files added:**
+${filesCreated.map((file) => `- \`${file}\``).join("\n")}
+
+The \`@bot-config-helper\` Copilot agent will be available after the PR is merged. This agent understands the bot's lowercase normalization behavior and can help fix gitleaks false positives.
+
+Review and merge the PR to enable the agent in this repository.`,
+      })
+    );
+
+    context.log.info({ owner, repo, issue: issue.number, pr: pr.data.number }, "Agent setup automation completed");
+  } catch (error) {
+    context.log.error({ error, owner, repo, issue: issue.number }, "Agent setup automation failed");
+    await context.octokit.issues.createComment(
+      context.issue({
+        body: `❌ Automation failed: ${error.message}
+
+Please check the bot logs or manually copy the agent template from:
+https://github.com/kumpeapps/KumpeApps-GitHub-Bot/tree/main/.github/templates/repository-setup`,
+      })
+    );
+  }
 }
 
 function toTitleCase(value) {

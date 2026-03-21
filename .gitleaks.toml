@@ -1,0 +1,67 @@
+# Gitleaks Configuration
+# Configuration file for KumpeApps-GitHub-Bot local secret scanner
+# IMPORTANT: All patterns must be lowercase (bot normalizes before matching)
+
+title = "KumpeApps-GitHub-Bot Repository"
+
+[allowlist]
+  description = "Global allowlist for false positives"
+
+  # Ignore documentation and agent template files
+  # Note: The bot normalizes paths to lowercase before matching
+  paths = [
+    '''readme\.md$''',
+    '''\.gitleaks\.toml$''',
+    '''\.gitleaksignore$''',
+    '''\.agent\.md$''',
+    '''\.prompt\.md$''',
+    '''\.instructions\.md$''',
+    '''.github/agents/''',
+    '''.github/templates/''',
+  ]
+
+  # Stop words - ignore these specific strings (normalized to lowercase by bot)
+  stopwords = [
+    "sites_dir",
+    "main_caddyfile",
+    "caddy_binary",
+    "backup_dir",
+    "/etc/caddy/caddyfile",
+    "/sites",
+    "validate-config",
+    "example.com",
+  ]
+
+  # Ignore common false positive patterns in documentation
+  regexes = [
+    # Example file paths and environment variables
+    '''(sites_dir|main_caddyfile|caddy_binary|backup_dir)=''',
+    '''=/etc/caddy/''',
+    '''=/sites''',
+    '''=/var/log/caddy/''',
+    '''\./validate-config\.sh''',
+    '''\./[a-z-]+\.sh''',
+    # Example domain names
+    '''example\.com''',
+    '''bot\.example\.com''',
+    # chmod commands
+    '''chmod [+\-][rwx]+''',
+    # Git commit messages  
+    '''commit -[am]''',
+    # bcrypt placeholder
+    '''<paste_bcrypt_hash_here>''',
+    # Base64 regex pattern in toml (the pattern itself, not actual secrets)
+    '''(?:[a-za-z0-9+/]{4})*(?:[a-za-z0-9+/]{2}==|[a-za-z0-9+/]{3}=)?''',
+  ]
+
+# Ignore agent documentation files completely
+[[rules]]
+  description = "Ignore agent and template documentation"
+  id = "agent-templates"
+  [rules.allowlist]
+    paths = [
+      '''\.agent\.md$''',
+      '''\.prompt\.md$''',
+      '''.github/agents/.*\.md$''',
+      '''.github/templates/.*\.md$''',
+    ]
