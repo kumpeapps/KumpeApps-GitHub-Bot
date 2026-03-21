@@ -1,0 +1,41 @@
+# Gitleaks Configuration
+# Configuration file for KumpeApps-GitHub-Bot local secret scanner
+# IMPORTANT: All patterns must be lowercase (bot normalizes before matching)
+
+title = "Repository Gitleaks Configuration"
+
+[allowlist]
+  description = "Global allowlist for false positives"
+
+  # Ignore documentation and configuration files
+  # Note: The bot normalizes paths to lowercase before matching
+  paths = [
+    '''readme\.md$''',
+    '''\.gitleaks\.toml$''',
+    '''\.gitleaksignore$''',
+    '''\.agent\.md$''',
+    '''\.prompt\.md$''',
+    '''\.instructions\.md$''',
+    '''.github/agents/''',
+    '''.github/prompts/''',
+  ]
+
+  # Stop words - ignore these specific strings (normalized to lowercase by bot)
+  stopwords = [
+    "example.com",
+    "main_caddyfile",
+    "sites_dir",
+  ]
+
+  # Ignore common false positive patterns in documentation
+  regexes = [
+    # Example domain names
+    '''example\.com''',
+    '''[a-z0-9-]+\.example\.com''',
+    # Common documentation placeholders
+    '''/etc/[a-z0-9/_-]+''',
+    # Script references
+    '''\./[a-z-]+\.sh''',
+    # Git commit messages
+    '''commit -[am]''',
+  ]

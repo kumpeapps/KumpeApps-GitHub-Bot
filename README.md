@@ -164,6 +164,12 @@ Security gates:
 - Local secret scanner (changed PR files):
   - regex + entropy-based detection for likely leaked tokens/keys
   - honors `.gitleaksignore` fingerprints and `.gitleaks.toml` allowlists for paths, regexes, and stopwords
+  - **Smart filtering** to reduce false positives:
+    - Auto-excludes markdown tables, code blocks, and headers
+    - Auto-excludes file paths and URLs
+    - Requires minimum 40-character length for entropy detection
+    - Uses 4.5 Shannon entropy threshold (higher = fewer false positives)
+    - Automatically skips documentation and configuration patterns
   - blocking on `dev/main/master`
 - For private repositories, Dependabot/secret-scanning API gates are skipped, but local secret scanner still runs by default.
 
