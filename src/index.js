@@ -2175,15 +2175,13 @@ async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepos
 
   if (isPrivateRepository) {
     ruleResults.push({ name: "Dependabot alert gate", passed: true, detail: "Skipped for private repositories." });
-    ruleResults.push({ name: "Secret-scanning alert gate", passed: true, detail: "Skipped for private repositories." });
-    warnings.push("Private repository: Dependabot and secret-scanning API gates are skipped; local secret scanner remains enforced.");
+    warnings.push("Private repository: Dependabot API gate is skipped; local secret scanner remains enforced.");
     await runLocalSecretScannerIfEnabled(context, owner, repo, policy, pullRequest, failures, ruleResults);
     return { failures, warnings, ruleResults };
   }
 
   if (!isSecurityGateEnabled(policy)) {
     ruleResults.push({ name: "Dependabot alert gate", passed: true, detail: "Disabled by SECURITY_GATES_ENABLED=false." });
-    ruleResults.push({ name: "Secret-scanning alert gate", passed: true, detail: "Disabled by SECURITY_GATES_ENABLED=false." });
     await runLocalSecretScannerIfEnabled(context, owner, repo, policy, pullRequest, failures, ruleResults);
     return { failures, warnings, ruleResults };
   }
@@ -2240,49 +2238,6 @@ async function runSecurityGates(context, owner, repo, baseBranch, isPrivateRepos
 
   if (!alertResult.available) {
     ruleResults.push({ name: "Dependabot alert gate", passed: false, detail: `${alertResult.reason}.` });
-  }
-
-  if (isSecretScanningGateEnabled(policy)) {
-    const secretAlertResult = await getOpenSecretScanningAlerts(context, owner, repo);
-
-    if (!secretAlertResult.available) {
-      failures.push(
-        `Security gate could not read secret-scanning alerts (${secretAlertResult.reason}). ${secretAlertResult.guidance}`
-      );
-      ruleResults.push({ name: "Secret-scanning alert gate", passed: false, detail: `${secretAlertResult.reason}.` });
-    } else if (secretAlertResult.alerts.length > 0) {
-      const preview = secretAlertResult.alerts
-        .slice(0, 3)
-        .map((alert) => `#${alert.number}`)
-        .join(", ");
-
-      const remediationSignals = await getRemediationSignals();
-      const isLikelySecretRemediation = remediationSignals.secretLikelyFix;
-
-      if (isLikelySecretRemediation) {
-        warnings.push(
-          `Security gate warning: ${secretAlertResult.alerts.length} open secret-scanning alert(s). Example(s): ${preview}. Treated as warning because this PR appears to remediate secret exposure issues.`
-        );
-        ruleResults.push({
-          name: "Secret-scanning alert gate",
-          passed: true,
-          detail: `${secretAlertResult.alerts.length} open secret-scanning alert(s) found (warning-only for remediation PR).`,
-        });
-      } else {
-        failures.push(
-          `Security gate failed: ${secretAlertResult.alerts.length} open secret-scanning alert(s). Example(s): ${preview}.`
-        );
-        ruleResults.push({
-          name: "Secret-scanning alert gate",
-          passed: false,
-          detail: `${secretAlertResult.alerts.length} open secret-scanning alert(s) found.`,
-        });
-      }
-    } else {
-      ruleResults.push({ name: "Secret-scanning alert gate", passed: true, detail: "No open secret-scanning alerts found." });
-    }
-  } else {
-    ruleResults.push({ name: "Secret-scanning alert gate", passed: true, detail: "Disabled by SECRET_SCANNING_GATES_ENABLED=false." });
   }
 
   await runLocalSecretScannerIfEnabled(context, owner, repo, policy, pullRequest, failures, ruleResults);
@@ -3159,45 +3114,12 @@ async function getOpenDependabotAlerts(context, owner, repo) {
   }
 }
 
-function isSecretScanningGateEnabled(policy) {
-  if (typeof policy?.security?.secretScanningGateEnabled === "boolean") {
-    return policy.security.secretScanningGateEnabled;
-  }
-
-  return normalizeType(process.env.SECRET_SCANNING_GATES_ENABLED || "true") !== "false";
-}
-
 function isLocalSecretScannerEnabled(policy) {
   if (typeof policy?.security?.localSecretScannerEnabled === "boolean") {
     return policy.security.localSecretScannerEnabled;
   }
 
   return normalizeType(process.env.LOCAL_SECRET_SCANNING_ENABLED || "true") !== "false";
-}
-
-async function getOpenSecretScanningAlerts(context, owner, repo) {
-  try {
-    const alerts = await context.octokit.paginate("GET /repos/{owner}/{repo}/secret-scanning/alerts", {
-      owner,
-      repo,
-      state: "open",
-      per_page: 100,
-    });
-
-    return {
-      available: true,
-      alerts,
-    };
-  } catch (error) {
-    context.log.warn({ error }, "Unable to read secret-scanning alerts for security gate");
-    const status = Number(error?.status || 0);
-    return {
-      available: false,
-      alerts: [],
-      reason: formatSecurityApiReason(status, "secret-scanning"),
-      guidance: formatSecurityApiGuidance(status, "Secret scanning alerts"),
-    };
-  }
 }
 
 function formatSecurityApiReason(status, gateName) {
